@@ -29,6 +29,7 @@ namespace HybridSurvey
         private const string kBlockLayer = "L-MON";
         private const double kTxtH = 2.5;
         private static readonly double[] kColW = { 40, 60, 60, 40, 120 };
+        internal const double kMatchTol = 0.03;       // vertex search tolerance
         private const double kRowH = 4.0;
 
         // inside HybridCommands, replace your old SimpleVertex with this:
@@ -316,8 +317,8 @@ namespace HybridSurvey
                     continue;
 
                 var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-                if (br.Position.DistanceTo(v.Pt) > 0.03)
-                    continue;                      // within 0.03 units?
+                if (br.Position.DistanceTo(v.Pt) > kMatchTol)
+                    continue;                      // within tolerance?
 
                 if (br.Name.ToUpperInvariant().StartsWith("HYBRID_"))
                 {
@@ -512,7 +513,7 @@ namespace HybridSurvey
 
             // 2) load stored metadata
             var oldData = ReadVertexData(plId, db);
-            var oldMap = oldData.ToDictionary(v => v.Pt, v => v, new Point3dEquality());
+            var oldMap = oldData.ToDictionary(v => v.Pt, v => v, new Point3dEquality(kMatchTol));
 
             // 3) rebuild current vertex list
             var verts = new List<VertexInfo>();
@@ -833,7 +834,7 @@ namespace HybridSurvey
 
             // 4) Build a new list for the target: preserve matches within tolerance
             var newList = new List<VertexInfo>();
-            var tol = 0.03;                                   // drawing precision
+            var tol = kMatchTol;                               // drawing precision
 
             using (var tr = db.TransactionManager.StartTransaction())
             {
@@ -913,7 +914,7 @@ namespace HybridSurvey
 
                 // 2) load existing metadata -------------------------------------------
                 var oldList = ReadVertexData(plId, db);
-                var oldMap = oldList.ToDictionary(v => v.Pt, v => v, new Point3dEquality());
+                var oldMap = oldList.ToDictionary(v => v.Pt, v => v, new Point3dEquality(kMatchTol));
 
                 // 3) find next free ID -------------------------------------------------
                 var existingIds = new List<int>();
@@ -1197,7 +1198,7 @@ namespace HybridSurvey
             var oldList = HybridCommands.ReadVertexData(_currentPlId, doc.Database);
 
             // FIX: skip duplicate Pt keys
-            var oldMap = new Dictionary<Point3d, VertexInfo>(new Point3dEquality());
+            var oldMap = new Dictionary<Point3d, VertexInfo>(new Point3dEquality(HybridCommands.kMatchTol));
             foreach (var v in oldList)
             {
                 if (!oldMap.ContainsKey(v.Pt))
@@ -1316,10 +1317,10 @@ namespace HybridSurvey
         private readonly double _eps;
         private readonly int _dec;
 
-        public Point3dEquality()
+        public Point3dEquality(double? customTol = null)
         {
             _dec = Convert.ToInt32(AcadApp.GetSystemVariable("LUPREC")); // 0-8
-            _eps = Math.Pow(10, -_dec) * 0.51;                          // half ULP
+            _eps = customTol ?? Math.Pow(10, -_dec) * 0.51;              // default ≈ half ULP
         }
 
         public bool Equals(Point3d a, Point3d b) =>
@@ -1327,7 +1328,7 @@ namespace HybridSurvey
 
         public int GetHashCode(Point3d p)
         {
-            double m = Math.Pow(10, _dec);          // scale to integer grid
+            double m = 1.0 / _eps;                   // scale to tolerance grid
             long ix = (long)Math.Round(p.X * m);
             long iy = (long)Math.Round(p.Y * m);
             return ((ix * 397) ^ iy).GetHashCode();
