@@ -1237,13 +1237,13 @@ namespace HybridSurvey
             for (int i = 0; i < _verts.Count; i++)
             {
                 var row = _grid.Rows[i];
-                double n = Math.Round(double.Parse(row.Cells["Northing"].Value.ToString()), 3);
-                double e = Math.Round(double.Parse(row.Cells["Easting"].Value.ToString()), 3);
+                double north = Math.Round(double.Parse(row.Cells["Northing"].Value.ToString()), 3);
+                double east = Math.Round(double.Parse(row.Cells["Easting"].Value.ToString()), 3);
                 _verts[i] = new VertexInfo
                 {
-                    Pt = new Point3d(e, n, 0),
-                    N = n,
-                    E = e,
+                    Pt = new Point3d(east, north, 0),
+                    N = north,
+                    E = east,
                     Type = row.Cells["Type"].Value?.ToString() ?? "",
                     Desc = row.Cells["Desc"].Value?.ToString() ?? ""
                 };
