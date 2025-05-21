@@ -828,39 +828,54 @@ namespace HybridSurvey
             if (perDst.Status != PromptStatus.OK) return;
             ObjectId dstId = perDst.ObjectId;
 
-            // 3) Read all metadata from source into a map by position
+            // 3) Read all metadata from source
             var srcList = ReadVertexData(srcId, db);
-            var srcMap = srcList.ToDictionary(v => v.Pt, v => v, new Point3dEquality());
 
-            // 4) Build a new list for the target: preserve matches, blank others
+            // 4) Build a new list for the target: preserve matches within tolerance
             var newList = new List<VertexInfo>();
+            var tol = 0.004;                                  // drawing precision
+
             using (var tr = db.TransactionManager.StartTransaction())
             {
                 var plDst = (Polyline)tr.GetObject(dstId, OpenMode.ForRead);
                 for (int i = 0; i < plDst.NumberOfVertices; i++)
                 {
                     var pt = plDst.GetPoint3dAt(i);
-                    if (srcMap.TryGetValue(pt, out var vi))
+
+                    int idx = srcList.FindIndex(v => v.Pt.DistanceTo(pt) <= tol);
+                    if (idx >= 0)
+                    {
+                        var vi = srcList[idx];
                         newList.Add(new VertexInfo
                         {
                             Pt = vi.Pt,
                             N = vi.N,
                             E = vi.E,
                             Type = vi.Type,
-                            Desc = vi.Desc
+                            Desc = vi.Desc,
+                            ID = vi.ID
                         });
+                        srcList.RemoveAt(idx);                 // mark as used
+                    }
                     else
+                    {
                         newList.Add(new VertexInfo
                         {
                             Pt = pt,
                             N = pt.Y,
                             E = pt.X,
                             Type = "",
-                            Desc = ""
+                            Desc = "",
+                            ID = 0
                         });
+                    }
                 }
                 tr.Commit();
             }
+
+            // append any leftover source vertices so metadata isn’t lost
+            foreach (var extra in srcList)
+                newList.Add(extra);
 
             // 5) Write that metadata back onto the target polyline
             WriteVertexData(dstId, db, newList);
