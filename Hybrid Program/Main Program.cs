@@ -73,8 +73,8 @@ namespace HybridSurvey
                 // serialize including ID
                 var list = verts.Select(v => new SimpleVertex
                 {
-                    X = v.Pt.X,
-                    Y = v.Pt.Y,
+                    X = Math.Round(v.Pt.X, 3),
+                    Y = Math.Round(v.Pt.Y, 3),
                     Type = v.Type,
                     Desc = v.Desc,
                     ID = v.ID      // ← new
@@ -316,8 +316,8 @@ namespace HybridSurvey
                     continue;
 
                 var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-                if (br.Position.DistanceTo(v.Pt) > 0.004)
-                    continue;                      // within 0.004 units?
+                if (br.Position.DistanceTo(v.Pt) > 0.03)
+                    continue;                      // within 0.03 units?
 
                 if (br.Name.ToUpperInvariant().StartsWith("HYBRID_"))
                 {
@@ -833,7 +833,7 @@ namespace HybridSurvey
 
             // 4) Build a new list for the target: preserve matches within tolerance
             var newList = new List<VertexInfo>();
-            var tol = 0.004;                                  // drawing precision
+            var tol = 0.03;                                   // drawing precision
 
             using (var tr = db.TransactionManager.StartTransaction())
             {
@@ -1044,11 +1044,13 @@ namespace HybridSurvey
                         if (double.TryParse(sN, out double N) &&
                             double.TryParse(sE, out double E))
                         {
+                            double n = Math.Round(N, 3);
+                            double e = Math.Round(E, 3);
                             verts.Add(new VertexInfo
                             {
-                                Pt = new Point3d(E, N, 0),
-                                N = N,
-                                E = E,
+                                Pt = new Point3d(e, n, 0),
+                                N = n,
+                                E = e,
                                 Type = tbl.Cells[r, 3].TextString,
                                 Desc = tbl.Cells[r, 4].TextString
                             });
@@ -1235,11 +1237,13 @@ namespace HybridSurvey
             for (int i = 0; i < _verts.Count; i++)
             {
                 var row = _grid.Rows[i];
+                double n = Math.Round(double.Parse(row.Cells["Northing"].Value.ToString()), 3);
+                double e = Math.Round(double.Parse(row.Cells["Easting"].Value.ToString()), 3);
                 _verts[i] = new VertexInfo
                 {
-                    Pt = _verts[i].Pt,
-                    N = double.Parse(row.Cells["Northing"].Value.ToString()),
-                    E = double.Parse(row.Cells["Easting"].Value.ToString()),
+                    Pt = new Point3d(e, n, 0),
+                    N = n,
+                    E = e,
                     Type = row.Cells["Type"].Value?.ToString() ?? "",
                     Desc = row.Cells["Desc"].Value?.ToString() ?? ""
                 };
