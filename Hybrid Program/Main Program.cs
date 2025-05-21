@@ -881,7 +881,7 @@ namespace HybridSurvey
         }
     }
 
-    internal sealed class VertexForm : Form
+    internal sealed class VertexForm : Form // test comit from vs
     {
         private readonly DataGridView _grid;
         private readonly CheckBox _chkHybrid;
