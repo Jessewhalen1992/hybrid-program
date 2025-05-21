@@ -298,7 +298,7 @@ namespace HybridSurvey
         {
             var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
             var space = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
-            var tol = CurrentTol();                                 // drawing precision
+            var tol = new Tolerance(1e-4, 1e-4);                    // drawing precision
 
             foreach (var v in verts)
             {
@@ -307,41 +307,35 @@ namespace HybridSurvey
                 if (vType != "XC" && vType != "RC" && vType != "EC")
                     continue;
 
-                bool found = false;          // correct block already at point?
-                var wrongAtPoint = new List<BlockReference>();
+            BlockReference nearby = null;          // hybrid block within tolerance?
 
-                // scan model space for blocks sitting at this vertex ------------------
-                foreach (ObjectId id in space)
+            // scan model space for blocks near this vertex ----------------
+            foreach (ObjectId id in space)
+            {
+                if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference)))
+                    continue;
+
+                var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
+                if (br.Position.DistanceTo(v.Pt) > 0.004)
+                    continue;                      // within 0.004 units?
+
+                if (br.Name.ToUpperInvariant().StartsWith("HYBRID_"))
                 {
-                    if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference)))
-                        continue;
-
-                    var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-                    if (!br.Position.IsEqualTo(v.Pt, tol))
-                        continue;                      // same XY within tolerance?
-
-                    var name = br.Name.ToUpperInvariant();
-                    if (name == $"HYBRID_{vType}")     // ✔ correct flavour exists
-                    {
-                        found = true;
-                    }
-                    else if (name.StartsWith("HYBRID_"))
-                    {                                  // but a wrong flavour – mark it
-                        wrongAtPoint.Add(br);
-                    }
+                    nearby = br;
+                    break;
                 }
+            }
 
-                // delete any wrong markers at this location ---------------------------
-                foreach (var br in wrongAtPoint)
+            if (nearby != null)
+            {
+                var name = nearby.Name.ToUpperInvariant();
+                if (name != $"HYBRID_{vType}")
                 {
-                    br.UpgradeOpen();
-                    br.Erase();
-                }
+                    var pos = nearby.Position;
+                    nearby.UpgradeOpen();
+                    nearby.Erase();
 
-                // insert missing marker -----------------------------------------------
-                if (!found)
-                {
-                    var nb = new BlockReference(v.Pt, bt[$"Hybrid_{vType}"])
+                    var nb = new BlockReference(pos, bt[$"Hybrid_{vType}"])
                     {
                         Layer = kBlockLayer,
                         ScaleFactors = new Scale3d(5, 5, 1)
@@ -349,6 +343,17 @@ namespace HybridSurvey
                     space.AppendEntity(nb);
                     tr.AddNewlyCreatedDBObject(nb, true);
                 }
+            }
+            else
+            {
+                var nb = new BlockReference(v.Pt, bt[$"Hybrid_{vType}"])
+                {
+                    Layer = kBlockLayer,
+                    ScaleFactors = new Scale3d(5, 5, 1)
+                };
+                space.AppendEntity(nb);
+                tr.AddNewlyCreatedDBObject(nb, true);
+            }
             }
         }
 
