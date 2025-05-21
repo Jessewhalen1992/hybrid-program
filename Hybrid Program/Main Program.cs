@@ -295,33 +295,42 @@ namespace HybridSurvey
             {
                 if (v.Type != "XC" && v.Type != "RC" && v.Type != "EC") continue;
 
-                var toDel = new List<BlockReference>();
-                bool found = false;
+                const double near = 0.004;
+                var same = (BlockReference)null;
+                var others = new List<BlockReference>();
+
                 foreach (ObjectId entId in space)
                 {
                     if (entId.ObjectClass != RXObject.GetClass(typeof(BlockReference)))
                         continue;
                     var br = (BlockReference)tr.GetObject(entId, OpenMode.ForRead);
-                    if (!br.Position.IsEqualTo(v.Pt, tol)) continue;
-                    var nm = br.Name.ToUpperInvariant();
-                    if (nm == $"HYBRID_{v.Type}") found = true;
-                    else if (nm.StartsWith("HYBRID_")) toDel.Add(br);
+                    if (!br.Name.StartsWith("Hybrid_", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (br.Position.DistanceTo(v.Pt) > near) continue;
+
+                    if (br.Name.Equals($"Hybrid_{v.Type}", StringComparison.OrdinalIgnoreCase))
+                        same = br;
+                    else
+                        others.Add(br);
                 }
-                foreach (var br in toDel)
+
+                foreach (var br in others)
                 {
                     br.UpgradeOpen();
                     br.Erase();
                 }
-                if (!found)
+
+                if (same != null)
+                    continue;
+
+                var insPt = others.Count > 0 ? others[0].Position : v.Pt;
+                var nb = new BlockReference(insPt, bt[$"Hybrid_{v.Type}"])
                 {
-                    var nb = new BlockReference(v.Pt, bt[$"Hybrid_{v.Type}"])
-                    {
-                        Layer = kBlockLayer,
-                        ScaleFactors = new Scale3d(5, 5, 1)
-                    };
-                    space.AppendEntity(nb);
-                    tr.AddNewlyCreatedDBObject(nb, true);
-                }
+                    Layer = kBlockLayer,
+                    ScaleFactors = new Scale3d(5, 5, 1)
+                };
+                space.AppendEntity(nb);
+                tr.AddNewlyCreatedDBObject(nb, true);
             }
         }
 
