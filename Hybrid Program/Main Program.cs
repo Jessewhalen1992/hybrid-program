@@ -42,27 +42,32 @@ namespace HybridSurvey
             public int ID;         // ← new
         }
 
-        public static void WriteVertexData(ObjectId plId, Database db, List<VertexInfo> verts)
+        public static void WriteVertexData(ObjectId plId,
+                                           Database db,
+                                           List<VertexInfo> verts)
         {
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
+
             using (doc.LockDocument())
             using (var tr = db.TransactionManager.StartTransaction())
             {
+                //-- ensure the polyline owns an extension dictionary
                 var pl = (Polyline)tr.GetObject(plId, OpenMode.ForWrite);
                 if (pl.ExtensionDictionary.IsNull)
                     pl.CreateExtensionDictionary();
+
                 var ext = (DBDictionary)tr.GetObject(pl.ExtensionDictionary, OpenMode.ForWrite);
 
-                DBDictionary dataDict;
-                if (ext.Contains("HybridData"))
-                    dataDict = (DBDictionary)tr.GetObject(ext.GetAt("HybridData"), OpenMode.ForWrite);
-                else
+                //-- ensure “HybridData” dictionary
+                if (!ext.Contains("HybridData"))
                 {
-                    dataDict = new DBDictionary();
-                    ext.SetAt("HybridData", dataDict);
-                    tr.AddNewlyCreatedDBObject(dataDict, true);
+                    var dict = new DBDictionary();
+                    ext.SetAt("HybridData", dict);
+                    tr.AddNewlyCreatedDBObject(dict, true);
                 }
+                var dataDict = (DBDictionary)tr.GetObject(ext.GetAt("HybridData"), OpenMode.ForWrite);
 
+                //-- ensure XRecord “Data”
                 Xrecord xr;
                 if (dataDict.Contains("Data"))
                     xr = (Xrecord)tr.GetObject(dataDict.GetAt("Data"), OpenMode.ForWrite);
@@ -73,23 +78,66 @@ namespace HybridSurvey
                     tr.AddNewlyCreatedDBObject(xr, true);
                 }
 
-                // serialize including ID
-                var list = verts.Select(v => new SimpleVertex
-                {
-                    X = Math.Round(v.Pt.X, 3),
-                    Y = Math.Round(v.Pt.Y, 3),
-                    Type = v.Type,
-                    Desc = v.Desc,
-                    ID = v.ID      // ← new
-                }).ToList();
-
-                xr.Data = new ResultBuffer(
-                    new TypedValue((int)DxfCode.Text, JsonConvert.SerializeObject(list))
+                //-- serialise payload  (round coordinates to 0.001)
+                var jsonPayload = JsonConvert.SerializeObject(
+                    verts.Select(v => new SimpleVertex
+                    {
+                        X = Math.Round(v.Pt.X, 3),
+                        Y = Math.Round(v.Pt.Y, 3),
+                        Type = v.Type,
+                        Desc = v.Desc,
+                        ID = v.ID
+                    }).ToList()
                 );
 
-                tr.Commit();
+                xr.Data = new ResultBuffer(new TypedValue((int)DxfCode.Text, jsonPayload));
+
+                tr.Commit();          // <-- commit once, here
             }
         }
+
+        private static void WriteTableMetadata(Table tbl, IList<VertexInfo> verts, Transaction tr)
+        {
+            // (a) guarantee an extension dictionary on the table
+            if (tbl.ExtensionDictionary.IsNull)
+                tbl.CreateExtensionDictionary();
+
+            var ext = (DBDictionary)tr.GetObject(tbl.ExtensionDictionary, OpenMode.ForWrite);
+
+            // (b) guarantee an inner dict called "HybridData"
+            if (!ext.Contains("HybridData"))
+            {
+                var d = new DBDictionary();
+                ext.SetAt("HybridData", d);
+                tr.AddNewlyCreatedDBObject(d, true);
+            }
+            var dataDict = (DBDictionary)tr.GetObject(ext.GetAt("HybridData"), OpenMode.ForWrite);
+
+            // (c) guarantee XRecord "Data"
+            Xrecord xr;
+            if (dataDict.Contains("Data"))
+                xr = (Xrecord)tr.GetObject(dataDict.GetAt("Data"), OpenMode.ForWrite);
+            else
+            {
+                xr = new Xrecord();
+                dataDict.SetAt("Data", xr);
+                tr.AddNewlyCreatedDBObject(xr, true);
+            }
+
+            // (d) same JSON you write on the polyline
+            var simple = verts.Select(v => new
+            {
+                X = Math.Round(v.Pt.X, 3),
+                Y = Math.Round(v.Pt.Y, 3),
+                v.Type,
+                v.Desc,
+                v.ID
+            });
+            xr.Data = new ResultBuffer(
+                new TypedValue((int)DxfCode.Text, JsonConvert.SerializeObject(simple))
+            );
+        }
+
         public static List<VertexInfo> ReadVertexData(ObjectId plId, Database db)
         {
             var result = new List<VertexInfo>();
@@ -710,21 +758,20 @@ namespace HybridSurvey
         }
 
 
-        private static BlockReference CreateBubble(
-            Transaction tr,
-            BlockTableRecord space,
-            BlockTable bt,
-            BlockTableRecord defRec,
-            Point3d pt,
-            int id)
+        private static BlockReference CreateBubble(Transaction tr,
+                                                   BlockTableRecord space,
+                                                   BlockTable bt,
+                                                   BlockTableRecord defRec,
+                                                   Point3d pt,
+                                                   int id)
         {
-            var nb = new BlockReference(pt, bt["Hybrd Num"])
+            var br = new BlockReference(pt, bt["Hybrd Num"])
             {
                 Layer = kBlockLayer,
                 ScaleFactors = new Scale3d(1, 1, 1)
             };
-            space.AppendEntity(nb);
-            tr.AddNewlyCreatedDBObject(nb, true);
+            space.AppendEntity(br);
+            tr.AddNewlyCreatedDBObject(br, true);
 
             foreach (ObjectId defId in defRec)
             {
@@ -734,13 +781,14 @@ namespace HybridSurvey
                     ar.SetAttributeFromBlock(def, Matrix3d.Identity);
                     ar.Position = pt;
                     ar.Invisible = def.Invisible;
-                    ar.TextString = def.Tag == "ID" ? id.ToString() : "";
-                    nb.AttributeCollection.AppendAttribute(ar);
+                    ar.TextString = def.Tag == "ID" ? id.ToString() : string.Empty;
+
+                    br.AttributeCollection.AppendAttribute(ar);
                     tr.AddNewlyCreatedDBObject(ar, true);
                 }
             }
-            tr.Commit();
-            return nb;
+
+            return br;    // caller commits
         }
 
         private static readonly Dictionary<ObjectId, Dictionary<Point3d, BlockReference>> _bubbleCache
@@ -1061,6 +1109,87 @@ namespace HybridSurvey
             doc.Editor.Regen();
         }
 
+
+        // -----------------------------------------------------------------------------
+        // 2)  TryReadTableMetadata  – returns true if the table contains the payload
+        // -----------------------------------------------------------------------------
+        private static bool TryReadTableMetadata(
+            ObjectId tblId,
+            Database db,
+            out List<VertexInfo> verts)
+        {
+            verts = new List<VertexInfo>();
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var tbl = (Table)tr.GetObject(tblId, OpenMode.ForRead);
+                if (tbl.ExtensionDictionary.IsNull) return false;
+
+                var ext = (DBDictionary)tr.GetObject(tbl.ExtensionDictionary, OpenMode.ForRead);
+                if (!ext.Contains("HybridData")) return false;
+
+                var dataDict = (DBDictionary)tr.GetObject(ext.GetAt("HybridData"), OpenMode.ForRead);
+                if (!dataDict.Contains("Data")) return false;
+
+                var xr = (Xrecord)tr.GetObject(dataDict.GetAt("Data"), OpenMode.ForRead);
+                var tv = xr.Data.Cast<TypedValue>()
+                                .FirstOrDefault(t => t.TypeCode == (int)DxfCode.Text);
+                if (tv == null) return false;
+
+                var list = JsonConvert.DeserializeObject<List<SimpleVertex>>((string)tv.Value);
+                if (list == null || list.Count == 0) return false;
+
+                verts = list.Select(sv => new VertexInfo
+                {
+                    Pt = new Point3d(sv.X, sv.Y, 0),
+                    N = sv.Y,
+                    E = sv.X,
+                    Type = sv.Type,
+                    Desc = sv.Desc,
+                    ID = sv.ID
+                }).ToList();
+
+                return true;
+            }
+        }
+
+
+        // -----------------------------------------------------------------------------
+        // 3)  ParseRowsFromTable  – your original “scan every row” fallback
+        // -----------------------------------------------------------------------------
+        private static List<VertexInfo> ParseRowsFromTable(Table tbl)
+        {
+            var verts = new List<VertexInfo>();
+            int rowCount = tbl.Rows.Count;
+
+            for (int r = 0; r < rowCount; r++)
+            {
+                string sN = tbl.Cells[r, 1].TextString;
+                string sE = tbl.Cells[r, 2].TextString;
+
+                if (double.TryParse(sN, out double N) &&
+                    double.TryParse(sE, out double E))
+                {
+                    double n = Math.Round(N, 3);
+                    double e = Math.Round(E, 3);
+                    verts.Add(new VertexInfo
+                    {
+                        Pt = new Point3d(e, n, 0),
+                        N = n,
+                        E = e,
+                        Type = tbl.Cells[r, 3].TextString,
+                        Desc = tbl.Cells[r, 4].TextString,
+                        ID = 0          // no ID info in visible rows
+                    });
+                }
+            }
+            return verts;
+        }
+
+
+        // -----------------------------------------------------------------------------
+        // 4)  RebuildPolylineFromTable  (complete replacement)
+        // -----------------------------------------------------------------------------
         [CommandMethod("REBUILDPLINEFROMTABLE")]
         public static void RebuildPolylineFromTable()
         {
@@ -1070,43 +1199,43 @@ namespace HybridSurvey
 
             using (doc.LockDocument())
             {
-                // pick the table
+                // pick the table -----------------------------------------------------
                 var peo = new PromptEntityOptions("\nSelect Hybrid-Points table: ");
-                peo.SetRejectMessage("\nEntity must be a Table");
+                peo.SetRejectMessage("\nEntity must be a Table.");
                 peo.AddAllowedClass(typeof(Table), false);
                 var per = ed.GetEntity(peo);
                 if (per.Status != PromptStatus.OK) return;
 
+                List<VertexInfo> verts;
+
+                // 1) Preferred path – pull JSON from the table itself
+                if (TryReadTableMetadata(per.ObjectId, db, out verts))
+                {
+                    ed.WriteMessage("\nUsing vertex metadata stored on the table.");
+                }
+                else
+                {
+                    // 2) Fallback – parse visible text rows
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        var tbl = (Table)tr.GetObject(per.ObjectId, OpenMode.ForRead);
+                        verts = ParseRowsFromTable(tbl);
+                        tr.Commit();
+                    }
+                }
+
+                if (verts.Count == 0)
+                {
+                    ed.WriteMessage("\nNo vertices found – nothing rebuilt.");
+                    return;
+                }
+
+                // build new polyline -------------------------------------------------
                 using (var tr = db.TransactionManager.StartTransaction())
                 {
                     var tbl = (Table)tr.GetObject(per.ObjectId, OpenMode.ForRead);
-                    int rowCount = tbl.Rows.Count;
-                    var verts = new List<VertexInfo>();
-
-                    // start at 0 to include the very first data row
-                    for (int r = 0; r < rowCount; r++)
-                    {
-                        string sN = tbl.Cells[r, 1].TextString;
-                        string sE = tbl.Cells[r, 2].TextString;
-
-                        if (double.TryParse(sN, out double N) &&
-                            double.TryParse(sE, out double E))
-                        {
-                            double n = Math.Round(N, 3);
-                            double e = Math.Round(E, 3);
-                            verts.Add(new VertexInfo
-                            {
-                                Pt = new Point3d(e, n, 0),
-                                N = n,
-                                E = e,
-                                Type = tbl.Cells[r, 3].TextString,
-                                Desc = tbl.Cells[r, 4].TextString
-                            });
-                        }
-                    }
-
-                    // build the new polyline
                     var btrOwner = (BlockTableRecord)tr.GetObject(tbl.OwnerId, OpenMode.ForWrite);
+
                     var pl = new Polyline();
                     for (int i = 0; i < verts.Count; i++)
                     {
@@ -1117,7 +1246,7 @@ namespace HybridSurvey
                     btrOwner.AppendEntity(pl);
                     tr.AddNewlyCreatedDBObject(pl, true);
 
-                    // persist metadata
+                    // persist metadata back onto the *new* polyline
                     WriteVertexData(pl.ObjectId, db, verts);
 
                     tr.Commit();
@@ -1125,6 +1254,7 @@ namespace HybridSurvey
                 }
             }
         }
+
     }
 
     internal sealed class VertexForm : Form
