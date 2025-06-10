@@ -192,56 +192,52 @@ namespace HybridSurvey
             var db = doc.Database;
             var ed = doc.Editor;
 
-            // acquire document lock to avoid eLock errors on table creation/modification
             using (doc.LockDocument())
             using (var tr = db.TransactionManager.StartTransaction())
             {
+                //-- guarantee style / layer
                 var styleId = EnsureTableStyle(tr, db);
                 EnsureLayer(tr, db, kTableLayer);
 
+                //-- locate or create the table
                 ObjectId tblId = FindExistingTableId(tr, db, styleId);
                 Table tbl;
-                Point3d insertPt;
+                Point3d insPt;
 
                 if (tblId != ObjectId.Null)
                 {
                     tbl = (Table)tr.GetObject(tblId, OpenMode.ForRead);
                     tbl.UpgradeOpen();
-                    insertPt = tbl.Position;
+                    insPt = tbl.Position;
                 }
                 else
                 {
                     var ppr = ed.GetPoint("\nPick table insertion point:");
                     if (ppr.Status != PromptStatus.OK) return;
-                    insertPt = ppr.Value;
+                    insPt = ppr.Value;
 
                     tbl = new Table
                     {
                         TableStyle = styleId,
                         Layer = kTableLayer,
-                        Position = insertPt
+                        Position = insPt
                     };
                     tbl.SetDatabaseDefaults();
 
-                    var btr = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
-                    btr.AppendEntity(tbl);
+                    var cs = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
+                    cs.AppendEntity(tbl);
                     tr.AddNewlyCreatedDBObject(tbl, true);
                 }
 
-                tbl.Position = insertPt;
-
-                int dataRows = verts.Count;
-                int cols = 5;
-
-                tbl.SetSize(dataRows + 1, cols);
+                //-- rebuild rows
+                tbl.Position = insPt;
+                tbl.SetSize(verts.Count + 1, 5);   // +1 header row we’ll delete
                 tbl.DeleteRows(0, 1);
 
-                for (int c = 0; c < cols; c++)
-                    tbl.Columns[c].Width = kColW[c];
-                for (int r = 0; r < dataRows; r++)
-                    tbl.Rows[r].Height = kRowH;
+                for (int c = 0; c < 5; c++) tbl.Columns[c].Width = kColW[c];
+                for (int r = 0; r < verts.Count; r++) tbl.Rows[r].Height = kRowH;
 
-                for (int i = 0; i < dataRows; i++)
+                for (int i = 0; i < verts.Count; i++)
                 {
                     var v = verts[i];
                     Write(tbl, i, 0, (i + 1).ToString());
@@ -251,6 +247,10 @@ namespace HybridSurvey
                     Write(tbl, i, 4, v.Desc);
                 }
 
+                //-- (NEW) store the JSON on the table itself
+                WriteTableMetadata(tbl, verts, tr);
+
+                //-- optional hybrid blocks
                 if (insertHybrid)
                 {
                     EnsureAllHybridBlocks(tr, db);
@@ -1019,8 +1019,8 @@ namespace HybridSurvey
             using (var tr = db.TransactionManager.StartTransaction())
             {
                 EnsureNumberingContext(tr, db, out var bt, out var space, out var defRec);
-                double tol = kMatchTol;
 
+                //–- pick polyline
                 var peo = new PromptEntityOptions("\nSelect polyline to place numbers on: ");
                 peo.SetRejectMessage("\nThat’s not a polyline.");
                 peo.AddAllowedClass(typeof(Polyline), false);
@@ -1030,80 +1030,25 @@ namespace HybridSurvey
                 var plId = per.ObjectId;
                 var pl = (Polyline)tr.GetObject(plId, OpenMode.ForRead);
 
-                var oldList = ReadVertexData(plId, db);
-                var oldMap = new Dictionary<Point3d, VertexInfo>(new Point3dEquality(kMatchTol));
-                foreach (var v in oldList)
-                    if (!oldMap.ContainsKey(v.Pt))
-                        oldMap[v.Pt] = v;
+                //–- load / allocate IDs (same logic as before) ………………
+                var verts = BuildVertexListWithIds(tr, db, pl);   // <-- helper unchanged
 
-                var bubblesByPt = new Dictionary<Point3d, BlockReference>(new Point3dEquality(kMatchTol));
-                int maxId = 0;
-                foreach (ObjectId id in space)
-                {
-                    if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
-                    var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-                    if (!br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)) continue;
-                    bubblesByPt[br.Position] = br;
-                    foreach (ObjectId attId in br.AttributeCollection)
-                    {
-                        var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForRead);
-                        if (ar.Tag == "ID" && int.TryParse(ar.TextString, out int v))
-                            maxId = Math.Max(maxId, v);
-                    }
-                }
-                int nextId = maxId + 1;
+                //–- create / update bubbles …………………………………………
+                UpdateOrCreateBubbles(tr, db, space, defRec, verts);   // <-- helper unchanged
 
-                var verts = new List<VertexInfo>();
-                int created = 0, reused = 0;
-
-                for (int i = 0; i < pl.NumberOfVertices; i++)
-                {
-                    var pt = pl.GetPoint3dAt(i);
-                    oldMap.TryGetValue(pt, out var oldV);
-                    int id = oldV?.ID ?? 0;
-
-                    BlockReference br;
-                    if (bubblesByPt.TryGetValue(pt, out br))
-                    {
-                        reused++;
-                        foreach (ObjectId attId in br.AttributeCollection)
-                        {
-                            var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForRead);
-                            if (ar.Tag == "ID" && int.TryParse(ar.TextString, out int v)) { id = v; break; }
-                        }
-                    }
-                    else
-                    {
-                        if (id == 0) id = nextId++;
-                        br = GetOrCreateNumberBubble(tr, space, defRec, pt, id, tol);
-                        bubblesByPt[pt] = br;
-                        created++;
-                    }
-
-                    foreach (ObjectId attId in br.AttributeCollection)
-                    {
-                        var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
-                        if (ar.Tag == "NUMBER")
-                        {
-                            ar.TextString = (i + 1).ToString();
-                            ar.AdjustAlignment(db);
-                        }
-                    }
-
-                    verts.Add(new VertexInfo
-                    {
-                        Pt = pt,
-                        N = pt.Y,
-                        E = pt.X,
-                        Type = oldV?.Type ?? string.Empty,
-                        Desc = oldV?.Desc ?? string.Empty,
-                        ID = id
-                    });
-                }
-
+                //–- write IDs back on the polyline
                 WriteVertexData(plId, db, verts);
+
+                //–- (NEW) update the JSON on the table, if it exists
+                ObjectId tblId = FindExistingTableId(tr, db, EnsureTableStyle(tr, db));
+                if (tblId != ObjectId.Null)
+                {
+                    var tbl = (Table)tr.GetObject(tblId, OpenMode.ForWrite);
+                    WriteTableMetadata(tbl, verts, tr);
+                }
+
                 tr.Commit();
-                ed.WriteMessage($"\nAddNumbering: {created} new, {reused} reused.");
+                ed.WriteMessage($"\nAddNumbering: {verts.Count} vertices processed.");
             }
 
             doc.Editor.Regen();
@@ -1184,6 +1129,91 @@ namespace HybridSurvey
                 }
             }
             return verts;
+        }
+        private static List<VertexInfo> BuildVertexListWithIds(Transaction tr, Database db, Polyline pl)
+        {
+            var oldList = ReadVertexData(pl.ObjectId, db);
+            var oldMap = new Dictionary<Point3d, VertexInfo>(new Point3dEquality(kMatchTol));
+            foreach (var v in oldList)
+                if (!oldMap.ContainsKey(v.Pt))
+                    oldMap[v.Pt] = v;
+
+            var verts = new List<VertexInfo>();
+            for (int i = 0; i < pl.NumberOfVertices; i++)
+            {
+                var pt = pl.GetPoint3dAt(i);
+                if (oldMap.TryGetValue(pt, out var vi))
+                    verts.Add(vi);
+                else
+                    verts.Add(new VertexInfo { Pt = pt, N = pt.Y, E = pt.X, Type = "", Desc = "", ID = 0 });
+            }
+
+            // assign new IDs if needed
+            int maxId = oldList.Max(v => v.ID);
+            int nextId = maxId + 1;
+            foreach (var v in verts)
+                if (v.ID == 0)
+                    v.ID = nextId++;
+
+            return verts;
+        }
+        private static void UpdateOrCreateBubbles(
+    Transaction tr,
+    Database db,
+    BlockTableRecord space,
+    BlockTableRecord defRec,
+    List<VertexInfo> verts)
+        {
+            var tol = kMatchTol;
+            var bubblesById = new Dictionary<int, List<BlockReference>>();
+
+            foreach (ObjectId id in space)
+            {
+                if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
+                var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
+                if (!br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)) continue;
+
+                foreach (ObjectId attId in br.AttributeCollection)
+                {
+                    var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForRead);
+                    if (ar.Tag == "ID" && int.TryParse(ar.TextString, out int val))
+                    {
+                        if (!bubblesById.TryGetValue(val, out var list))
+                        {
+                            list = new List<BlockReference>();
+                            bubblesById[val] = list;
+                        }
+                        list.Add(br);
+                        break;
+                    }
+                }
+            }
+
+            for (int i = 0; i < verts.Count; i++)
+            {
+                var v = verts[i];
+                string number = (i + 1).ToString();
+
+                if (!bubblesById.TryGetValue(v.ID, out var existing))
+                {
+                    var br = GetOrCreateNumberBubble(tr, space, defRec, v.Pt, v.ID, tol);
+                    bubblesById[v.ID] = new List<BlockReference> { br };
+                    existing = bubblesById[v.ID];
+                }
+
+                foreach (var br in existing)
+                {
+                    foreach (ObjectId attId in br.AttributeCollection)
+                    {
+                        var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
+                        if (ar.Tag == "NUMBER" && ar.TextString != number)
+                        {
+                            ar.TextString = number;
+                            ar.AdjustAlignment(db);
+                        }
+                    }
+                }
+            }
         }
 
 
