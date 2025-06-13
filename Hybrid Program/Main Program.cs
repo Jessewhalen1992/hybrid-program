@@ -38,6 +38,7 @@ namespace HybridSurvey
         //  Read-only protection for NUMBER / ID attributes in "Hybrd Num"
         // -----------------------------------------------------------------
         private static bool _allowInternalEdits = false;  // toggled by helper
+        private static readonly object _editLock = new object();
         private static bool _warnedOnce         = false;  // only one console msg
 
         // Static ctor runs when the class is first touched
@@ -49,31 +50,45 @@ namespace HybridSurvey
 
         private static void Db_ObjectModified(object sender, ObjectEventArgs e)
         {
-            if (_allowInternalEdits) return;               // program change → allow
+            // ─── ignore programmatic edits or events from other DWGs ──────────────
+            if (_allowInternalEdits) return;
+            if (e.DBObject.Database != HostApplicationServices.WorkingDatabase) return;
 
-            if (e.DBObject is AttributeReference ar)
+            // we only care about NUMBER / ID in “Hybrd Num”
+            if (!(e.DBObject is AttributeReference ar)) return;
+
+            string tag = ar.Tag?.ToUpperInvariant();
+            if (tag != "NUMBER" && tag != "ID") return;
+
+            var br = ar.OwnerId.GetObject(OpenMode.ForRead) as BlockReference;
+            if (br == null || !br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)) return;
+
+            // ─── restore the correct text ─────────────────────────────────────────
+            using (var tr = ar.Database.TransactionManager.StartOpenCloseTransaction())
             {
-                string tag = ar.Tag?.ToUpperInvariant();
-                if (tag != "NUMBER" && tag != "ID") return;
+                var arW = (AttributeReference)tr.GetObject(ar.ObjectId, OpenMode.ForWrite);
 
-                var br = ar.OwnerId.GetObject(OpenMode.ForRead) as BlockReference;
-                if (br == null || !br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase))
-                    return;
-
-                // Cancel the user edit by restoring the pre-modify value
-                using (var tr = ar.Database.TransactionManager.StartOpenCloseTransaction())
+                if (tag == "ID")
                 {
-                    var arW = (AttributeReference)tr.GetObject(ar.ObjectId, OpenMode.ForWrite);
-                    arW.TextString = arW.TextString;   // rewrite cached original
-                    tr.Commit();
+                    // ID never changes → simply roll it back to the numeric value already cached
+                    if (!int.TryParse(arW.TextString, out _))
+                        arW.TextString = arW.TextString.TrimStart('#');
+                }
+                else   // NUMBER
+                {
+                    int correct = GetNumberForId(arW, arW.Database);
+                    if (correct > 0 && arW.TextString != correct.ToString())
+                        arW.TextString = correct.ToString();
                 }
 
-                if (!_warnedOnce)
-                {
-                    AcadApp.DocumentManager.MdiActiveDocument.Editor.WriteMessage(
-                        "\nHybrid NUMBER / ID are managed by the plug-in and cannot be edited manually.");
-                    _warnedOnce = true;
-                }
+                tr.Commit();
+            }
+
+            if (!_warnedOnce)
+            {
+                AcadApp.DocumentManager.MdiActiveDocument.Editor.WriteMessage(
+                    "\nHybridSurvey ► NUMBER / ID are managed by the plug-in; manual edits are ignored.");
+                _warnedOnce = true;
             }
         }
 
@@ -981,13 +996,43 @@ namespace HybridSurvey
             return new Tolerance(eps, eps);
         }
 
+        /// <summary>
+        /// Returns the 1-based sequence number that should be displayed
+        /// for the bubble whose hidden ID matches the given attribute.
+        /// </summary>
+        private static int GetNumberForId(AttributeReference ar, Database db)
+        {
+            // locate the bubble’s position
+            var br = (BlockReference)ar.OwnerId.GetObject(OpenMode.ForRead);
+            Point3d pos = br.Position;
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var ms = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
+
+                foreach (ObjectId entId in ms)
+                {
+                    if (entId.ObjectClass != RXObject.GetClass(typeof(Polyline))) continue;
+
+                    var pl = (Polyline)tr.GetObject(entId, OpenMode.ForRead);
+                    var verts = ReadVertexData(pl.ObjectId, db);
+                    int idx = verts.FindIndex(v => v.ID == int.Parse(ar.TextString));
+                    if (idx >= 0) return idx + 1;   // sequence number is index + 1
+                }
+            }
+            return -1;   // not found – should never happen
+        }
+
         /// <summary>Runs <paramref name="action"/> while temporarily allowing
         /// edits to protected NUMBER / ID attributes.</summary>
         private static void AllowProtectedEdits(Action action)
         {
-            _allowInternalEdits = true;
-            try { action(); }
-            finally { _allowInternalEdits = false; }
+            lock (_editLock)
+            {
+                _allowInternalEdits = true;
+                try { action(); }
+                finally { _allowInternalEdits = false; }
+            }
         }
 
 
