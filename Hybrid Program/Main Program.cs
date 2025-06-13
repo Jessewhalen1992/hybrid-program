@@ -34,6 +34,49 @@ namespace HybridSurvey
         internal const double kMatchTol = 0.03;       // vertex search tolerance
         private const double kRowH = 4.0;
 
+        // -----------------------------------------------------------------
+        //  Read-only protection for NUMBER / ID attributes in "Hybrd Num"
+        // -----------------------------------------------------------------
+        private static bool _allowInternalEdits = false;  // toggled by helper
+        private static bool _warnedOnce         = false;  // only one console msg
+
+        // Static ctor runs when the class is first touched
+        static HybridCommands()
+        {
+            var db = HostApplicationServices.WorkingDatabase;
+            db.ObjectModified += Db_ObjectModified;
+        }
+
+        private static void Db_ObjectModified(object sender, ObjectEventArgs e)
+        {
+            if (_allowInternalEdits) return;               // program change → allow
+
+            if (e.DBObject is AttributeReference ar)
+            {
+                string tag = ar.Tag?.ToUpperInvariant();
+                if (tag != "NUMBER" && tag != "ID") return;
+
+                var br = ar.OwnerId.GetObject(OpenMode.ForRead) as BlockReference;
+                if (br == null || !br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                // Cancel the user edit by restoring the pre-modify value
+                using (var tr = ar.Database.TransactionManager.StartOpenCloseTransaction())
+                {
+                    var arW = (AttributeReference)tr.GetObject(ar.ObjectId, OpenMode.ForWrite);
+                    arW.TextString = arW.TextString;   // rewrite cached original
+                    tr.Commit();
+                }
+
+                if (!_warnedOnce)
+                {
+                    AcadApp.DocumentManager.MdiActiveDocument.Editor.WriteMessage(
+                        "\nHybrid NUMBER / ID are managed by the plug-in and cannot be edited manually.");
+                    _warnedOnce = true;
+                }
+            }
+        }
+
         // inside HybridCommands, replace your old SimpleVertex with this:
         private class SimpleVertex
         {
@@ -671,8 +714,11 @@ namespace HybridSurvey
                             var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
                             if (ar.Tag == "NUMBER")
                             {
-                                if (ar.TextString != seq) { ar.TextString = seq; renumbered++; }
-                                ar.AdjustAlignment(db);
+                                AllowProtectedEdits(() =>
+                                {
+                                    if (ar.TextString != seq) { ar.TextString = seq; renumbered++; }
+                                    ar.AdjustAlignment(db);
+                                });
                             }
                         }
                     }
@@ -781,7 +827,10 @@ namespace HybridSurvey
                     ar.SetAttributeFromBlock(def, Matrix3d.Identity);
                     ar.Position = pt;
                     ar.Invisible = def.Invisible;
-                    ar.TextString = def.Tag == "ID" ? id.ToString() : string.Empty;
+                    AllowProtectedEdits(() =>
+                    {
+                        ar.TextString = def.Tag == "ID" ? id.ToString() : string.Empty;
+                    });
 
                     br.AttributeCollection.AppendAttribute(ar);
                     tr.AddNewlyCreatedDBObject(ar, true);
@@ -823,7 +872,7 @@ namespace HybridSurvey
                 {
                     var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
                     if (ar.Tag == "ID" && ar.TextString != id.ToString())
-                        ar.TextString = id.ToString();
+                        AllowProtectedEdits(() => { ar.TextString = id.ToString(); });
                 }
                 return br;
             }
@@ -843,7 +892,10 @@ namespace HybridSurvey
                     ar.SetAttributeFromBlock(def, Matrix3d.Identity);
                     ar.Position = pt;
                     ar.Invisible = def.Invisible;
-                    ar.TextString = def.Tag == "ID" ? id.ToString() : "";
+                    AllowProtectedEdits(() =>
+                    {
+                        ar.TextString = def.Tag == "ID" ? id.ToString() : "";
+                    });
                     nb.AttributeCollection.AppendAttribute(ar);
                     tr.AddNewlyCreatedDBObject(ar, true);
                 }
@@ -909,7 +961,7 @@ namespace HybridSurvey
                 arNew.SetAttributeFromBlock(idDef, Matrix3d.Identity);
                 arNew.Position = br.Position;
                 arNew.Invisible = true;
-                arNew.TextString = nextId.ToString();
+                AllowProtectedEdits(() => { arNew.TextString = nextId.ToString(); });
                 br.AttributeCollection.AppendAttribute(arNew);
                 tr.AddNewlyCreatedDBObject(arNew, true);
                 nextId++;
@@ -927,6 +979,15 @@ namespace HybridSurvey
             if (prec < 2) return new Tolerance(kMatchTol, kMatchTol);
             double eps = Math.Pow(10, -prec) * 0.51;                         // ≈ 0.5 ULP
             return new Tolerance(eps, eps);
+        }
+
+        /// <summary>Runs <paramref name="action"/> while temporarily allowing
+        /// edits to protected NUMBER / ID attributes.</summary>
+        private static void AllowProtectedEdits(Action action)
+        {
+            _allowInternalEdits = true;
+            try { action(); }
+            finally { _allowInternalEdits = false; }
         }
 
 
@@ -1208,8 +1269,11 @@ namespace HybridSurvey
                         var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
                         if (ar.Tag == "NUMBER" && ar.TextString != number)
                         {
-                            ar.TextString = number;
-                            ar.AdjustAlignment(db);
+                            AllowProtectedEdits(() =>
+                            {
+                                ar.TextString = number;
+                                ar.AdjustAlignment(db);
+                            });
                         }
                     }
                 }
