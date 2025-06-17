@@ -24,6 +24,39 @@ using System.Security.Cryptography;
 
 namespace HybridSurvey
 {
+    // ----------------------------------------------------------------------
+    //  Basic data types used across the plug-in
+    // ----------------------------------------------------------------------
+    internal class VertexInfo
+    {
+        public Point3d Pt;
+        public double N, E;
+        public string Type, Desc;
+        public int ID;
+    }
+
+    internal class Point3dEquality : IEqualityComparer<Point3d>
+    {
+        private readonly double _eps;
+        private readonly int _dec;
+
+        public Point3dEquality(double? customTol = null)
+        {
+            _dec = Convert.ToInt32(AcadApp.GetSystemVariable("LUPREC")); // 0-8
+            _eps = customTol ?? Math.Pow(10, -_dec) * 0.51; // ≈ half ULP
+        }
+
+        public bool Equals(Point3d a, Point3d b) =>
+            Math.Abs(a.X - b.X) <= _eps && Math.Abs(a.Y - b.Y) <= _eps;
+
+        public int GetHashCode(Point3d p)
+        {
+            double m = 1.0 / _eps; // scale to tolerance grid
+            long ix = (long)Math.Round(p.X * m);
+            long iy = (long)Math.Round(p.Y * m);
+            return ((ix * 397) ^ iy).GetHashCode();
+        }
+    }
 
     // -----------------------------------------------------------------------------
     //  HybridGuard  – prevents manual edits to “Hybrd Num” bubbles
@@ -1703,35 +1736,4 @@ namespace HybridSurvey
         }
     }
 
-    internal class VertexInfo
-    {
-        public Point3d Pt;
-        public double N, E;
-        public string Type, Desc;
-        public int ID;
-    }
-
-    internal class Point3dEquality : IEqualityComparer<Point3d>
-    {
-        private readonly double _eps;
-        private readonly int _dec;
-
-        public Point3dEquality(double? customTol = null)
-        {
-            _dec = Convert.ToInt32(AcadApp.GetSystemVariable("LUPREC")); // 0-8
-            _eps = customTol ?? Math.Pow(10, -_dec) * 0.51;              // default ≈ half ULP
-        }
-
-        public bool Equals(Point3d a, Point3d b) =>
-            Math.Abs(a.X - b.X) <= _eps && Math.Abs(a.Y - b.Y) <= _eps;
-
-        public int GetHashCode(Point3d p)
-        {
-            double m = 1.0 / _eps;                   // scale to tolerance grid
-            long ix = (long)Math.Round(p.X * m);
-            long iy = (long)Math.Round(p.Y * m);
-            return ((ix * 397) ^ iy).GetHashCode();
-        }
-    }
-}
 
