@@ -34,64 +34,6 @@ namespace HybridSurvey
         internal const double kMatchTol = 0.03;       // vertex search tolerance
         private const double kRowH = 4.0;
 
-        // -----------------------------------------------------------------
-        //  Read-only protection for NUMBER / ID attributes in "Hybrd Num"
-        // -----------------------------------------------------------------
-        private static bool _allowInternalEdits = false;  // toggled by helper
-        private static readonly object _editLock = new object();
-        private static bool _warnedOnce         = false;  // only one console msg
-
-        // Static ctor runs when the class is first touched
-        static HybridCommands()
-        {
-            var db = HostApplicationServices.WorkingDatabase;
-            db.ObjectModified += Db_ObjectModified;
-        }
-
-        private static void Db_ObjectModified(object sender, ObjectEventArgs e)
-        {
-            // ─── ignore programmatic edits or events from other DWGs ──────────────
-            if (_allowInternalEdits) return;
-            if (e.DBObject.Database != HostApplicationServices.WorkingDatabase) return;
-
-            // we only care about NUMBER / ID in “Hybrd Num”
-            if (!(e.DBObject is AttributeReference ar)) return;
-
-            string tag = ar.Tag?.ToUpperInvariant();
-            if (tag != "NUMBER" && tag != "ID") return;
-
-            var br = ar.OwnerId.GetObject(OpenMode.ForRead) as BlockReference;
-            if (br == null || !br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)) return;
-
-            // ─── restore the correct text ─────────────────────────────────────────
-            using (var tr = ar.Database.TransactionManager.StartOpenCloseTransaction())
-            {
-                var arW = (AttributeReference)tr.GetObject(ar.ObjectId, OpenMode.ForWrite);
-
-                if (tag == "ID")
-                {
-                    // ID never changes → simply roll it back to the numeric value already cached
-                    if (!int.TryParse(arW.TextString, out _))
-                        arW.TextString = arW.TextString.TrimStart('#');
-                }
-                else   // NUMBER
-                {
-                    int correct = GetNumberForId(arW, arW.Database);
-                    if (correct > 0 && arW.TextString != correct.ToString())
-                        arW.TextString = correct.ToString();
-                }
-
-                tr.Commit();
-            }
-
-            if (!_warnedOnce)
-            {
-                AcadApp.DocumentManager.MdiActiveDocument.Editor.WriteMessage(
-                    "\nHybridSurvey ► NUMBER / ID are managed by the plug-in; manual edits are ignored.");
-                _warnedOnce = true;
-            }
-        }
-
         // inside HybridCommands, replace your old SimpleVertex with this:
         private class SimpleVertex
         {
@@ -622,8 +564,8 @@ namespace HybridSurvey
         public static void UpdateNumbering()
         {
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
-            var db  = doc.Database;
-            var ed  = doc.Editor;
+            var db = doc.Database;
+            var ed = doc.Editor;
 
             // 1) Pick the polyline
             var peo = new PromptEntityOptions("\nSelect polyline to renumber: ");
@@ -709,7 +651,9 @@ namespace HybridSurvey
                     {
                         var brNew = GetOrCreateNumberBubble(tr, space, defRec, v.Pt, v.ID, kMatchTol); created++;
                         idToBr[v.ID] = new List<BlockReference> { brNew };
-                    } else {
+                    }
+                    else
+                    {
                         reused += idToBr[v.ID].Count;
                     }
                 }
@@ -729,11 +673,8 @@ namespace HybridSurvey
                             var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
                             if (ar.Tag == "NUMBER")
                             {
-                                AllowProtectedEdits(() =>
-                                {
-                                    if (ar.TextString != seq) { ar.TextString = seq; renumbered++; }
-                                    ar.AdjustAlignment(db);
-                                });
+                                if (ar.TextString != seq) { ar.TextString = seq; renumbered++; }
+                                ar.AdjustAlignment(db);
                             }
                         }
                     }
@@ -842,10 +783,7 @@ namespace HybridSurvey
                     ar.SetAttributeFromBlock(def, Matrix3d.Identity);
                     ar.Position = pt;
                     ar.Invisible = def.Invisible;
-                    AllowProtectedEdits(() =>
-                    {
-                        ar.TextString = def.Tag == "ID" ? id.ToString() : string.Empty;
-                    });
+                    ar.TextString = def.Tag == "ID" ? id.ToString() : string.Empty;
 
                     br.AttributeCollection.AppendAttribute(ar);
                     tr.AddNewlyCreatedDBObject(ar, true);
@@ -887,7 +825,7 @@ namespace HybridSurvey
                 {
                     var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
                     if (ar.Tag == "ID" && ar.TextString != id.ToString())
-                        AllowProtectedEdits(() => { ar.TextString = id.ToString(); });
+                        ar.TextString = id.ToString();
                 }
                 return br;
             }
@@ -907,10 +845,7 @@ namespace HybridSurvey
                     ar.SetAttributeFromBlock(def, Matrix3d.Identity);
                     ar.Position = pt;
                     ar.Invisible = def.Invisible;
-                    AllowProtectedEdits(() =>
-                    {
-                        ar.TextString = def.Tag == "ID" ? id.ToString() : "";
-                    });
+                    ar.TextString = def.Tag == "ID" ? id.ToString() : "";
                     nb.AttributeCollection.AppendAttribute(ar);
                     tr.AddNewlyCreatedDBObject(ar, true);
                 }
@@ -976,7 +911,7 @@ namespace HybridSurvey
                 arNew.SetAttributeFromBlock(idDef, Matrix3d.Identity);
                 arNew.Position = br.Position;
                 arNew.Invisible = true;
-                AllowProtectedEdits(() => { arNew.TextString = nextId.ToString(); });
+                arNew.TextString = nextId.ToString();
                 br.AttributeCollection.AppendAttribute(arNew);
                 tr.AddNewlyCreatedDBObject(arNew, true);
                 nextId++;
@@ -994,45 +929,6 @@ namespace HybridSurvey
             if (prec < 2) return new Tolerance(kMatchTol, kMatchTol);
             double eps = Math.Pow(10, -prec) * 0.51;                         // ≈ 0.5 ULP
             return new Tolerance(eps, eps);
-        }
-
-        /// <summary>
-        /// Returns the 1-based sequence number that should be displayed
-        /// for the bubble whose hidden ID matches the given attribute.
-        /// </summary>
-        private static int GetNumberForId(AttributeReference ar, Database db)
-        {
-            // locate the bubble’s position
-            var br = (BlockReference)ar.OwnerId.GetObject(OpenMode.ForRead);
-            Point3d pos = br.Position;
-
-            using (var tr = db.TransactionManager.StartTransaction())
-            {
-                var ms = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
-
-                foreach (ObjectId entId in ms)
-                {
-                    if (entId.ObjectClass != RXObject.GetClass(typeof(Polyline))) continue;
-
-                    var pl = (Polyline)tr.GetObject(entId, OpenMode.ForRead);
-                    var verts = ReadVertexData(pl.ObjectId, db);
-                    int idx = verts.FindIndex(v => v.ID == int.Parse(ar.TextString));
-                    if (idx >= 0) return idx + 1;   // sequence number is index + 1
-                }
-            }
-            return -1;   // not found – should never happen
-        }
-
-        /// <summary>Runs <paramref name="action"/> while temporarily allowing
-        /// edits to protected NUMBER / ID attributes.</summary>
-        private static void AllowProtectedEdits(Action action)
-        {
-            lock (_editLock)
-            {
-                _allowInternalEdits = true;
-                try { action(); }
-                finally { _allowInternalEdits = false; }
-            }
         }
 
 
@@ -1314,11 +1210,8 @@ namespace HybridSurvey
                         var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
                         if (ar.Tag == "NUMBER" && ar.TextString != number)
                         {
-                            AllowProtectedEdits(() =>
-                            {
-                                ar.TextString = number;
-                                ar.AdjustAlignment(db);
-                            });
+                            ar.TextString = number;
+                            ar.AdjustAlignment(db);
                         }
                     }
                 }
@@ -1552,33 +1445,33 @@ namespace HybridSurvey
         private void InsertUpdate_Click(object sender, EventArgs e)
         {
 
-        for (int i = 0; i < _verts.Count; i++)
-        {
-            var row = _grid.Rows[i];
-            double north = Math.Round(double.Parse(row.Cells["Northing"].Value.ToString()), 3);
-            double east = Math.Round(double.Parse(row.Cells["Easting"].Value.ToString()), 3);
-
-            _verts[i] = new VertexInfo
+            for (int i = 0; i < _verts.Count; i++)
             {
-                Pt = new Point3d(east, north, 0),
-                N = north,
-                E = east,
-                Type = row.Cells["Type"].Value?.ToString() ?? "",
-                Desc = row.Cells["Desc"].Value?.ToString() ?? "",
-                ID = _verts[i].ID
-            };
-        }
+                var row = _grid.Rows[i];
+                double north = Math.Round(double.Parse(row.Cells["Northing"].Value.ToString()), 3);
+                double east = Math.Round(double.Parse(row.Cells["Easting"].Value.ToString()), 3);
 
-        // 3) Push the updates back into the drawing
-        HybridCommands.InsertOrUpdate(_verts, _chkHybrid.Checked);
-        HybridCommands.WriteVertexData(
-            _currentPlId,
-            AcadApp.DocumentManager.MdiActiveDocument.Database,
-            _verts
-        );
+                _verts[i] = new VertexInfo
+                {
+                    Pt = new Point3d(east, north, 0),
+                    N = north,
+                    E = east,
+                    Type = row.Cells["Type"].Value?.ToString() ?? "",
+                    Desc = row.Cells["Desc"].Value?.ToString() ?? "",
+                    ID = _verts[i].ID
+                };
+            }
 
-        // 4) Refresh the grid display
-        RefreshGrid();
+            // 3) Push the updates back into the drawing
+            HybridCommands.InsertOrUpdate(_verts, _chkHybrid.Checked);
+            HybridCommands.WriteVertexData(
+                _currentPlId,
+                AcadApp.DocumentManager.MdiActiveDocument.Database,
+                _verts
+            );
+
+            // 4) Refresh the grid display
+            RefreshGrid();
         }
 
         private void RefreshGrid()
@@ -1656,4 +1549,4 @@ namespace HybridSurvey
             return ((ix * 397) ^ iy).GetHashCode();
         }
     }
-}
+} 
