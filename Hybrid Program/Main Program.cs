@@ -1369,7 +1369,7 @@ namespace HybridSurvey
             }
 
             // assign new IDs if needed
-            int maxId = oldList.Max(v => v.ID);
+            int maxId = oldList.Any() ? oldList.Max(v => v.ID) : 0;
             int nextId = maxId + 1;
             foreach (var v in verts)
                 if (v.ID == 0)
@@ -1735,5 +1735,5 @@ namespace HybridSurvey
             }
         }
     }
-
+}
 
