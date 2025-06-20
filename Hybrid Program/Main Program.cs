@@ -84,7 +84,7 @@ namespace HybridSurvey
              // *** clipboard / insert commands that bring in new blocks ***
              "PASTECLIP","PASTEORIG",   // Ctrl-V / Paste to Orig. Coord.
              "INSERT","-INSERT",        // classic & command-line insert
-             "COPYCLIP","COPYBASE"      // in case user copies within the same DWG
+             "COPYCLIP","COPYBASE", "PINSERT"      // in case user copies within the same DWG
             };
         /* ---  internal “suspend” flag ----------------------------------------- */
         private static int _suspendDepth;
@@ -260,6 +260,9 @@ namespace HybridSurvey
             public int ID;         // ← new
         }
 
+        // ──────────────────────────────────────────────────────────────────────────────
+        // 1)  WriteVertexData  – now safely handles a polyline that was ERASED / UNDOed
+        // ──────────────────────────────────────────────────────────────────────────────
         public static void WriteVertexData(ObjectId plId,
                                            Database db,
                                            List<VertexInfo> verts)
@@ -269,8 +272,22 @@ namespace HybridSurvey
             using (doc.LockDocument())
             using (var tr = db.TransactionManager.StartTransaction())
             {
+                // ── SAFE OPEN ──
+                Polyline pl;
+                try
+                {
+                    // ‘false’ → don’t allow access to an object that is already erased
+                    pl = (Polyline)tr.GetObject(plId, OpenMode.ForWrite, false);
+                }
+                catch (Autodesk.AutoCAD.Runtime.Exception ex) when (IsWasErased(ex))
+                {
+                    // the polyline was deleted/undone – silently bail
+                    return;
+                }
+
+                if (pl == null) return;          // sanity (shouldn’t happen)
+
                 //-- ensure the polyline owns an extension dictionary
-                var pl = (Polyline)tr.GetObject(plId, OpenMode.ForWrite);
                 if (pl.ExtensionDictionary.IsNull)
                     pl.CreateExtensionDictionary();
 
@@ -310,8 +327,14 @@ namespace HybridSurvey
 
                 xr.Data = new ResultBuffer(new TypedValue((int)DxfCode.Text, jsonPayload));
 
-                tr.Commit();          // <-- commit once, here
+                tr.Commit();     // commit once, here
             }
+        }
+        // put this helper somewhere in HybridCommands, HybridGuard, or a utilities file
+        private static bool IsWasErased(Autodesk.AutoCAD.Runtime.Exception ex)
+        {
+            const int kWasErased = 52;   // ErrorStatus.eWasErased in all full runtimes
+            return (int)ex.ErrorStatus == kWasErased;
         }
 
         private static void WriteTableMetadata(Table tbl, IList<VertexInfo> verts, Transaction tr)
@@ -532,8 +555,13 @@ namespace HybridSurvey
             else
             {
                 var ltr = (LayerTableRecord)tr.GetObject(lt[name], OpenMode.ForWrite);
-                ltr.IsFrozen = false;
-                ltr.IsLocked = false;
+
+                // ⬇️ Only touch these flags if it is *not* the current layer
+                if (db.Clayer != ltr.ObjectId)
+                {
+                    ltr.IsFrozen = false;
+                    ltr.IsLocked = false;
+                }
             }
         }
 
@@ -602,40 +630,31 @@ namespace HybridSurvey
         {
             var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
             var space = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
-            var tol = CurrentTol();                    // drawing precision
 
             foreach (var v in verts)
             {
-                // XC / RC / EC only ---------------------------------------------------
-                var vType = (v.Type ?? string.Empty).Trim().ToUpperInvariant();
-                if (vType != "XC" && vType != "RC" && vType != "EC")
-                    continue;
+                string vType = (v.Type ?? "").Trim().ToUpperInvariant();
+                if (vType != "XC" && vType != "RC" && vType != "EC") continue;
 
-                BlockReference nearby = null;          // hybrid block within tolerance?
-
-                // scan model space for blocks near this vertex ----------------
+                // ── look for an existing HYBRID_* block within kMatchTol (0.03 m) ──
+                BlockReference nearby = null;
                 foreach (ObjectId id in space)
                 {
-                    if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference)))
-                        continue;
+                    if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
 
                     var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-                    if (br.Position.DistanceTo(v.Pt) > kMatchTol)
-                        continue;                      // within tolerance?
+                    if (br.Position.DistanceTo(v.Pt) > kMatchTol) continue;
 
-                    if (br.Name.ToUpperInvariant().StartsWith("HYBRID_"))
-                    {
-                        nearby = br;
-                        break;
-                    }
+                    if (br.Name.StartsWith("Hybrid_", StringComparison.OrdinalIgnoreCase))
+                    { nearby = br; break; }
                 }
 
+                // ── correct / replace / create ──
                 if (nearby != null)
                 {
-                    var name = nearby.Name.ToUpperInvariant();
-                    if (name != $"HYBRID_{vType}")
+                    if (!nearby.Name.Equals($"Hybrid_{vType}", StringComparison.OrdinalIgnoreCase))
                     {
-                        var pos = nearby.Position;
+                        Point3d pos = nearby.Position;
                         nearby.UpgradeOpen();
                         nearby.Erase();
 
@@ -665,20 +684,19 @@ namespace HybridSurvey
         {
             var db = AcadApp.DocumentManager.MdiActiveDocument.Database;
             var ms = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
-            var tol = CurrentTol();                          // ← dynamic tolerance
 
             foreach (ObjectId id in ms)
             {
                 if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
-                var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-                if (!br.Position.IsEqualTo(pt, tol)) continue;
 
-                var nm = br.Name.ToUpperInvariant();
+                var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
+                if (br.Position.DistanceTo(pt) > kMatchTol) continue;   // ⬅︎ 0.03 m snap
+
+                string nm = br.Name.ToUpperInvariant();
                 if (nm.Contains("HYBRID_XC")) return "XC";
                 if (nm.Contains("HYBRID_RC")) return "RC";
                 if (nm.Contains("HYBRID_EC")) return "EC";
-                if (nm.StartsWith("FDI") || nm.StartsWith("FDSPIKE"))
-                    return "OC";
+                if (nm.StartsWith("FDI") || nm.StartsWith("FDSPIKE")) return "OC";
             }
             return "";
         }
@@ -784,17 +802,35 @@ namespace HybridSurvey
         }
 
         private static void EnsureNumberingContext(
-            Transaction tr,
-            Database db,
-            out BlockTable bt,
-            out BlockTableRecord space,
-            out BlockTableRecord defRec)
+            Transaction tr, Database db,
+            out BlockTable bt, out BlockTableRecord space, out BlockTableRecord defRec)
         {
+            // guarantee the layer definition exists
             EnsureLayer(tr, db, kBlockLayer);
+
+            // -- if L-MON is current AND locked, temporarily swap to layer 0 -------------
+            ObjectId oldClayer = db.Clayer;
+            var ltrMon = (LayerTableRecord)tr.GetObject(
+                             ((LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead))[kBlockLayer],
+                             OpenMode.ForWrite);
+
+            if (db.Clayer == ltrMon.ObjectId && ltrMon.IsLocked)
+            {
+                db.Clayer = ((LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead))["0"];
+                ltrMon.IsLocked = false;   // safe now – it’s **not** current
+            }
+            else if (ltrMon.IsLocked)
+            {
+                ltrMon.IsLocked = false;   // not current, just unlock
+            }
+
             EnsureHybridNumBlock(tr, db);
             bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
             space = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForWrite);
             defRec = (BlockTableRecord)tr.GetObject(bt["Hybrd Num"], OpenMode.ForRead);
+
+            // put the user back on their original layer
+            if (db.Clayer != oldClayer) db.Clayer = oldClayer;
         }
         /// <summary>
         /// Re-sorts all existing "Hybrd Num" blocks along the picked polyline
@@ -1010,6 +1046,11 @@ namespace HybridSurvey
         /// from every polyline in model‐space.  After running this, your polylines will
         /// look “un‐tagged” and you can re-run AddNumbering/InsertUpdate to rebuild them.
         /// </summary>
+        /// <summary>
+        /// Removes the “HybridData” Xrecord from every polyline in model space,
+        /// unlocking / relocking any layers it needs to touch so that the purge
+        /// always succeeds and never crashes with eOnLockedLayer.
+        /// </summary>
         [CommandMethod("PurgeHybridData")]
         public static void PurgeHybridData()
         {
@@ -1020,32 +1061,52 @@ namespace HybridSurvey
             using (doc.LockDocument())
             using (var tr = db.TransactionManager.StartTransaction())
             {
-                // iterate every entity in model‐space
-                var btr = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
-                foreach (ObjectId id in btr)
+                var btrMs = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
+
+                int purged = 0;
+
+                foreach (ObjectId entId in btrMs)
                 {
-                    // look only for polylines
-                    var pl = tr.GetObject(id, OpenMode.ForWrite) as Polyline;
-                    if (pl == null || pl.ExtensionDictionary.IsNull)
-                        continue;
+                    // --- only consider polylines -------------------------------------------------
+                    if (!(tr.GetObject(entId, OpenMode.ForRead) is Polyline pl)) continue;
 
-                    // open the extension dict
-                    var ext = (DBDictionary)tr.GetObject(pl.ExtensionDictionary, OpenMode.ForWrite);
-                    if (!ext.Contains("HybridData"))
-                        continue;
+                    // layer info ­- we might have to unlock it temporarily
+                    var lyrRec = (LayerTableRecord)tr.GetObject(pl.LayerId, OpenMode.ForWrite);
+                    bool relock = false;
 
-                    // grab & erase the Xrecord
-                    var xrecId = ext.GetAt("HybridData");
-                    ext.Remove("HybridData");
+                    if (lyrRec.IsLocked)
+                    {
+                        lyrRec.IsLocked = false;   // ← safe: the layer may be current
+                        relock = true;
+                    }
 
-                    var xrec = tr.GetObject(xrecId, OpenMode.ForWrite) as Xrecord;
-                    xrec?.Erase();
+                    // switch the polyline to write-mode *after* we’re sure the layer is unlocked
+                    pl.UpgradeOpen();
+
+                    if (!pl.ExtensionDictionary.IsNull)
+                    {
+                        var ext = (DBDictionary)tr.GetObject(pl.ExtensionDictionary, OpenMode.ForWrite);
+                        if (ext.Contains("HybridData"))
+                        {
+                            // erase the Xrecord + remove the entry from the dict
+                            var xrecId = ext.GetAt("HybridData");
+                            ext.Remove("HybridData");
+
+                            if (tr.GetObject(xrecId, OpenMode.ForWrite) is Xrecord xr)
+                                xr.Erase();
+
+                            purged++;
+                        }
+                    }
+
+                    // put the layer back the way we found it
+                    if (relock) lyrRec.IsLocked = true;
                 }
 
                 tr.Commit();
+                ed.WriteMessage($"\nPurged HybridData from {purged} polyline{(purged == 1 ? "" : "s")}.");
             }
 
-            ed.WriteMessage("\nAll HybridData has been purged from every polyline.");
             doc.Editor.Regen();
         }
 
@@ -1694,9 +1755,26 @@ namespace HybridSurvey
             RefreshGrid();
         }
 
+        // ──────────────────────────────────────────────────────────────────────────────
+        // 2)  InsertUpdate_Click – early guard if the cached polyline vanished
+        // ──────────────────────────────────────────────────────────────────────────────
         private void InsertUpdate_Click(object sender, EventArgs e)
         {
+            // ---- make sure the polyline still exists before we touch the DB ----
+            if (_currentPlId == ObjectId.Null ||
+                !_currentPlId.IsValid ||
+                _currentPlId.IsErased)
+            {
+                MessageBox.Show(
+                    "The polyline you selected earlier no longer exists.\n\n" +
+                    "Pick a new polyline with “Get Polyline” and try again.",
+                    "Hybrid Vertex Editor",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
 
+            // ---------- original body follows unchanged ----------
             for (int i = 0; i < _verts.Count; i++)
             {
                 var row = _grid.Rows[i];
@@ -1714,16 +1792,14 @@ namespace HybridSurvey
                 };
             }
 
-            // 3) Push the updates back into the drawing
+            // push the updates
             HybridCommands.InsertOrUpdate(_verts, _chkHybrid.Checked);
             HybridCommands.WriteVertexData(
                 _currentPlId,
                 AcadApp.DocumentManager.MdiActiveDocument.Database,
-                _verts
-            );
+                _verts);
 
-            // 4) Refresh the grid display
-            RefreshGrid();
+            RefreshGrid();   // keep the UI in sync
         }
 
         private void RefreshGrid()
