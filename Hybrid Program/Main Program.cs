@@ -76,7 +76,7 @@ namespace HybridSurvey
             {
             // attribute‑safe commands
             "ATTSYNC",
-            "MOVE", "COPY", "ROTATE", "SCALE", "MIRROR", "STRETCH",
+            "MOVE", "COPY", "ROTATE", "SCALE", "MIRROR", "STRETCH","SAVE", "QSAVE", "SAVEAS",
 
             // grip‑edit variants that AutoCAD raises internally
             "GRIP_MOVE", "GRIP_STRETCH", "GRIP_SCALE", "GRIP_ROTATE", "GRIP_MIRROR"
@@ -165,6 +165,7 @@ namespace HybridSurvey
             hook(e.Document.Database);   // idempotent
         }
 
+
         /* ============================  events  ================================= */
         private static void onOpened(object sender, ObjectEventArgs e)
         {
@@ -176,31 +177,42 @@ namespace HybridSurvey
             }
         }
 
+        /* ============================  events  ================================= */
+        /* ============================  events  ================================= */
         private static void onModified(object sender, ObjectEventArgs e)
         {
+            // 1) Skip if the guard is suspended by a whitelisted command
             if (Suspended) return;
 
+            // 2) React only to NUMBER attributes
             var ar = e.DBObject as AttributeReference;
-            if (ar == null || !ar.Tag.Equals("NUMBER", StringComparison.OrdinalIgnoreCase)) return;
+            if (ar == null || !ar.Tag.Equals("NUMBER", StringComparison.OrdinalIgnoreCase))
+                return;
 
+            // 3) Make sure the attribute belongs to a Hybrd Num block
             var tr = ar.Database.TransactionManager;
-            var br = ar.OwnerId.IsValid ? tr.GetObject(ar.OwnerId, OpenMode.ForRead) as BlockReference : null;
+            var br = ar.OwnerId.IsValid
+                   ? tr.GetObject(ar.OwnerId, OpenMode.ForRead) as BlockReference
+                   : null;
             if (br == null) return;
 
             string name = br.IsDynamicBlock
-                        ? ((BlockTableRecord)tr.GetObject(br.DynamicBlockTableRecord, OpenMode.ForRead)).Name
-                        : br.Name;
+                ? ((BlockTableRecord)tr.GetObject(br.DynamicBlockTableRecord, OpenMode.ForRead)).Name
+                : br.Name;
 
-            if (!name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)) return;
+            if (!name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase))
+                return;
 
-            if (_orig.TryGetValue(ar.ObjectId, out var oldVal) && oldVal != ar.TextString)
+            // 4) Revert any manual text change
+            if (_orig.TryGetValue(ar.ObjectId, out string oldVal) && oldVal != ar.TextString)
             {
-                ar.UpgradeOpen();
+                if (!ar.IsWriteEnabled) ar.UpgradeOpen();  // request write access only if needed
                 ar.TextString = oldVal;
                 ar.AdjustAlignment(ar.Database);
             }
             _orig.Remove(ar.ObjectId);
 
+            // 5) Show the rate-limited pop-up reminder
             if ((DateTime.Now - _lastPopup).TotalSeconds >= POPUP_COOLDOWN_SEC)
             {
                 _lastPopup = DateTime.Now;
