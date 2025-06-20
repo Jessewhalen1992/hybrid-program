@@ -79,7 +79,12 @@ namespace HybridSurvey
             "MOVE", "COPY", "ROTATE", "SCALE", "MIRROR", "STRETCH","SAVE", "QSAVE", "SAVEAS","QUIT","EXIT","CLOSE","CLOSEALL","CLOSEALLOTHER",
 
             // grip‑edit variants that AutoCAD raises internally
-            "GRIP_MOVE", "GRIP_STRETCH", "GRIP_SCALE", "GRIP_ROTATE", "GRIP_MIRROR"
+            "GRIP_MOVE", "GRIP_STRETCH", "GRIP_SCALE", "GRIP_ROTATE", "GRIP_MIRROR",
+
+             // *** clipboard / insert commands that bring in new blocks ***
+             "PASTECLIP","PASTEORIG",   // Ctrl-V / Paste to Orig. Coord.
+             "INSERT","-INSERT",        // classic & command-line insert
+             "COPYCLIP","COPYBASE"      // in case user copies within the same DWG
             };
         /* ---  internal “suspend” flag ----------------------------------------- */
         private static int _suspendDepth;
