@@ -76,7 +76,7 @@ namespace HybridSurvey
             {
             // attribute‑safe commands
             "ATTSYNC",
-            "MOVE", "COPY", "ROTATE", "SCALE", "MIRROR", "STRETCH","SAVE", "QSAVE", "SAVEAS",
+            "MOVE", "COPY", "ROTATE", "SCALE", "MIRROR", "STRETCH","SAVE", "QSAVE", "SAVEAS","QUIT","EXIT","CLOSE","CLOSEALL","CLOSEALLOTHER",
 
             // grip‑edit variants that AutoCAD raises internally
             "GRIP_MOVE", "GRIP_STRETCH", "GRIP_SCALE", "GRIP_ROTATE", "GRIP_MIRROR"
@@ -433,7 +433,7 @@ namespace HybridSurvey
                     var styleId = EnsureTableStyle(tr, db);
                     EnsureLayer(tr, db, kTableLayer);
 
-                    ObjectId tblId = FindExistingTableId(tr, db, styleId);
+                    ObjectId tblId = FindExistingTableId(tr, db, styleId, kTableLayer);
                     Table tbl;
                     Point3d insPt;
 
@@ -532,16 +532,33 @@ namespace HybridSurvey
             }
         }
 
-        private static ObjectId FindExistingTableId(Transaction tr, Database db, ObjectId styleId)
+        /// <summary>
+        /// Returns the ObjectId of the first table that
+        ///   • has the requested TableStyle, and
+        ///   • sits on the given layer.
+        /// If none found, returns ObjectId.Null.
+        /// </summary>
+        private static ObjectId FindExistingTableId(
+            Transaction tr,
+            Database db,
+            ObjectId styleId,
+            string layerName)
         {
             var ms = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
+
             foreach (ObjectId entId in ms)
             {
                 var tbl = tr.GetObject(entId, OpenMode.ForRead) as Table;
-                if (tbl != null && tbl.TableStyle == styleId)
-                    return entId;
+                if (tbl == null) continue;
+
+                bool styleMatch = tbl.TableStyle == styleId;
+                bool layerMatch = tbl.Layer.Equals(layerName, StringComparison.OrdinalIgnoreCase);
+
+                if (styleMatch && layerMatch)
+                    return entId;               // ← found the one we should update
             }
-            return ObjectId.Null;
+
+            return ObjectId.Null;               // ← none on that layer ⇒ create new
         }
 
         private static void EnsureAllHybridBlocks(Transaction tr, Database db)
@@ -825,7 +842,7 @@ namespace HybridSurvey
 
                     WriteVertexData(plId, db, verts);
 
-                    ObjectId tblId = FindExistingTableId(tr, db, EnsureTableStyle(tr, db));
+                    ObjectId tblId = FindExistingTableId(tr, db, EnsureTableStyle(tr, db), kTableLayer);
                     if (tblId != ObjectId.Null)
                     {
                         var tbl = (Table)tr.GetObject(tblId, OpenMode.ForWrite);
