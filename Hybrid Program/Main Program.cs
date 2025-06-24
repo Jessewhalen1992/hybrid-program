@@ -73,19 +73,24 @@ namespace HybridSurvey
         // ─────────────────────────────────────────────────────────────────────────
         private static readonly HashSet<string> _passThroughCmds =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-            // attribute‑safe commands
-            "ATTSYNC",
-            "MOVE", "COPY", "ROTATE", "SCALE", "MIRROR", "STRETCH","SAVE", "QSAVE", "SAVEAS","QUIT","EXIT","CLOSE","CLOSEALL","CLOSEALLOTHER",
+    {
+        // attribute-safe edits
+        "ATTSYNC",
+        "MOVE","COPY","ROTATE","SCALE","MIRROR","STRETCH",
+        "SAVE","QSAVE","SAVEAS","QUIT","EXIT","CLOSE","CLOSEALL","CLOSEALLOTHER",
 
-            // grip‑edit variants that AutoCAD raises internally
-            "GRIP_MOVE", "GRIP_STRETCH", "GRIP_SCALE", "GRIP_ROTATE", "GRIP_MIRROR",
+        // grip / interactive
+        "GRIP_MOVE","GRIP_STRETCH","GRIP_SCALE","GRIP_ROTATE","GRIP_MIRROR",
+        "DRAGMOVE","DRAG","NUDGE",          // ← NEW: mouse drag & nudge
 
-             // *** clipboard / insert commands that bring in new blocks ***
-             "PASTECLIP","PASTEORIG",   // Ctrl-V / Paste to Orig. Coord.
-             "INSERT","-INSERT",        // classic & command-line insert
-             "COPYCLIP","COPYBASE", "PINSERT"      // in case user copies within the same DWG
-            };
+        // clipboard / insert
+        "PASTECLIP","PASTEORIG",
+        "INSERT","-INSERT","PINSERT",
+        "COPYCLIP","COPYBASE",
+
+        // undo / redo family
+        "UNDO","U","REDO","OOPS"
+    };
         /* ---  internal “suspend” flag ----------------------------------------- */
         private static int _suspendDepth;
         internal static IDisposable Suspend()
@@ -183,7 +188,6 @@ namespace HybridSurvey
         }
 
         /* ============================  events  ================================= */
-        /* ============================  events  ================================= */
         private static void onModified(object sender, ObjectEventArgs e)
         {
             // 1) Skip if the guard is suspended by a whitelisted command
@@ -227,19 +231,28 @@ namespace HybridSurvey
                     "change you make is immediately reverted.");
             }
         }
+        private static string Canon(string cmd)
+        {
+            int i = 0;
+            while (i < cmd.Length && (cmd[i] == '.' || cmd[i] == '_' ||
+                                      cmd[i] == '*' || cmd[i] == '\''))
+                i++;
+            return cmd.Substring(i);
+        }
 
         /* ---------- command hooks: suspend guard during ATTSYNC --------------- */
-        private static void CmdWillStart(object sender, CommandEventArgs e)
+        private static void CmdWillStart(object s, CommandEventArgs e)
         {
-            if (_passThroughCmds.Contains(e.GlobalCommandName))
-                _suspendDepth++;           // pause the guard for the duration
+            if (_passThroughCmds.Contains(Canon(e.GlobalCommandName)))
+                _suspendDepth++;
         }
 
-        private static void CmdEnded(object sender, CommandEventArgs e)
+        private static void CmdEnded(object s, CommandEventArgs e)
         {
-            if (_passThroughCmds.Contains(e.GlobalCommandName))
-                _suspendDepth--;           // resume normal guarding
+            if (_passThroughCmds.Contains(Canon(e.GlobalCommandName)) && _suspendDepth > 0)
+                _suspendDepth--;
         }
+
     }
 
     internal static class HybridCommands
