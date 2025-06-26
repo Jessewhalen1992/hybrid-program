@@ -107,14 +107,33 @@ namespace HybridSurvey
         /* =======================  IExtensionApplication ======================= */
         public void Initialize()
         {
-            // 1) already‑open drawings
+            // ── 1) crash black-box ─────────────────────────────────────────────
+            AppDomain.CurrentDomain.UnhandledException += (s, a) =>
+            {
+                try
+                {
+                    var ex = (System.Exception)a.ExceptionObject;  // ← fully-qualified
+                    string dump =
+                        $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}]\n" +
+                        $"Unhandled: {ex}\n" +
+                        $"Inner:     {ex.InnerException}\n\n";
+
+                    System.IO.File.AppendAllText(
+                        System.IO.Path.Combine(
+                            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                            "HybridGuard_log.txt"),
+                        dump);
+                }
+                catch { /* absolutely nothing */ }
+            };
+
+            // ── 2) original initialise body ────────────────────────────────────
             foreach (Document doc in AcadApp.DocumentManager)
             {
                 hook(doc.Database);
                 WireCommandHooks(doc);
             }
 
-            // 2) future drawings
             AcadApp.DocumentManager.DocumentCreated += OnDocCreated;
             AcadApp.DocumentManager.DocumentActivated += OnDocActivated;
         }
@@ -244,13 +263,13 @@ namespace HybridSurvey
         private static void CmdWillStart(object s, CommandEventArgs e)
         {
             if (_passThroughCmds.Contains(Canon(e.GlobalCommandName)))
-                _suspendDepth++;
+                _suspendDepth++;              // pause the guard
         }
 
         private static void CmdEnded(object s, CommandEventArgs e)
         {
             if (_passThroughCmds.Contains(Canon(e.GlobalCommandName)) && _suspendDepth > 0)
-                _suspendDepth--;
+                _suspendDepth--;              // resume
         }
 
     }
