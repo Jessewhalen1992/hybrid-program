@@ -2173,13 +2173,15 @@ namespace HybridSurvey
         /// and reassigns only the NUMBER attribute (ID stays fixed).
         /// </summary>
         // VertexForm.cs  – replace the whole PickAndPopulate method
+        // VertexForm.cs – full replacement for PickAndPopulate()
+        // VertexForm.cs – revised PickAndPopulate
         private void PickAndPopulate()
         {
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
-            /* ────────────────── let the user pick a polyline ────────────────── */
+            // 1) Let the user pick a polyline
             var opts = new PromptEntityOptions("\nSelect polyline");
             opts.SetRejectMessage("\nMust be a polyline");
             opts.AddAllowedClass(typeof(Polyline), false);
@@ -2188,10 +2190,9 @@ namespace HybridSurvey
 
             _currentPlId = res.ObjectId;
 
-            /* ─── [MISSING JSON CHECK] ────────────────────────────────────────── */
+            // 2) Read any stored HybridData
             var jsonList = HybridCommands.ReadVertexData(_currentPlId, db);
             bool payloadMissing;
-
             using (var tr = db.TransactionManager.StartTransaction())
             {
                 var pl = (Polyline)tr.GetObject(_currentPlId, OpenMode.ForRead);
@@ -2201,37 +2202,68 @@ namespace HybridSurvey
 
             if (payloadMissing)
             {
+                // 3) Warn and ask to build from scratch
                 var answer = MessageBox.Show(
-                    "This polyline has vertices but no Hybrid-Data metadata.\n\n" +
-                    "Re-build the table and bubbles from scratch?",
+                    "This polyline has vertices but no Hybrid‑Data metadata.\n\n" +
+                    "Re‑build the table and bubbles from scratch?",
                     "Hybrid Survey",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Question);
 
                 if (answer == DialogResult.Yes)
                 {
-                    // blank list → InsertOrUpdate will create a fresh table + bubbles
-                    _verts = new List<VertexInfo>();      // nothing to pre-populate
-                    HybridCommands.InsertOrUpdate(_verts, insertHybrid: true);
-                    ed.WriteMessage("\nRebuilt table & bubbles with empty Type/Desc.");
-                    return;   // nothing more to show in the grid
-                }
-                else
-                {
-                    return;   // user declined; abort safely
-                }
-            }
-            /* ─────────────────────────────────────────────────────────────────── */
+                    // 4) Build a list of VertexInfo from the polyline’s vertices
+                    var verts = new List<VertexInfo>();
+                    using (var tr = db.TransactionManager.StartTransaction())
+                    {
+                        var pl = (Polyline)tr.GetObject(_currentPlId, OpenMode.ForRead);
+                        for (int i = 0; i < pl.NumberOfVertices; i++)
+                        {
+                            var pt = pl.GetPoint3dAt(i);
+                            verts.Add(new VertexInfo
+                            {
+                                Pt = pt,
+                                N = pt.Y,
+                                E = pt.X,
+                                Type = "",   // blank type and description for new vertices
+                                Desc = ""
+                            });
+                        }
+                        tr.Commit();
+                    }
 
-            // --- existing logic -------------------------------------------------
-            // skip duplicate Pt keys
+                    // 5) Assign unique, non‑zero IDs to each vertex
+                    int nextId = 1;
+                    foreach (var v in verts)
+                    {
+                        v.ID = nextId++;
+                    }
+
+                    // 6) Update the polyline geometry (no shape change, just syncing vertex count)
+                    HybridCommands.UpdatePolylineGeometry(_currentPlId, verts);
+
+                    // 7) Insert a new table and bubbles for these vertices
+                    HybridCommands.InsertOrUpdate(verts, insertHybrid: true);
+
+                    // 8) Persist metadata back onto the polyline
+                    HybridCommands.WriteVertexData(_currentPlId, db, verts);
+
+                    // 9) Populate the grid
+                    _verts = verts;
+                    RefreshGrid();
+                }
+                return; // don’t continue with the old logic
+            }
+
+            // If metadata exists, continue with existing logic
+            // Skip duplicate point keys
             var oldMap = new Dictionary<Point3d, VertexInfo>(
                 new Point3dEquality(HybridCommands.kMatchTol));
             foreach (var v in jsonList)
                 if (!oldMap.ContainsKey(v.Pt))
                     oldMap.Add(v.Pt, v);
 
-            // build the new list in vertex order
+            // Build the list in vertex order
             var newList = new List<VertexInfo>();
             using (var tr = db.TransactionManager.StartTransaction())
             {
