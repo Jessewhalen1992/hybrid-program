@@ -798,24 +798,42 @@ namespace HybridSurvey
             {
                 if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
                 var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-                if (!br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)) continue;
 
-                /* fetch hidden ID (-1 if missing / unreadable) */
+                // recognize both Hybrd Num and legacy Hybrid Num, incl. dynamic
+                string nm;
+                if (br.IsDynamicBlock)
+                {
+                    var dyn = (BlockTableRecord)tr.GetObject(br.DynamicBlockTableRecord, OpenMode.ForRead);
+                    nm = dyn?.Name ?? br.Name;
+                }
+                else nm = br.Name;
+                nm = (nm ?? string.Empty).Trim();
+                if (!(nm.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase) ||
+                      nm.Equals("Hybrid Num", StringComparison.OrdinalIgnoreCase)))
+                    continue;
+
                 int idVal = -1;
                 foreach (ObjectId attId in br.AttributeCollection)
                 {
                     var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForRead);
-                    if (ar.Tag == "ID" && int.TryParse(ar.TextString, out int v))
+                    if (ar == null) continue;
+                    if ((ar.Tag ?? string.Empty).Equals("ID", StringComparison.OrdinalIgnoreCase) &&
+                        int.TryParse(ar.TextString?.Trim(), out int v))
                     {
                         idVal = v;
                         break;
                     }
                 }
 
-                if (!keepIds.Contains(idVal))        // stray → delete
+                if (!keepIds.Contains(idVal))
                 {
+                    // safe erase (unlock layer temporarily if needed)
+                    var lyr = (LayerTableRecord)tr.GetObject(br.LayerId, OpenMode.ForWrite);
+                    bool relock = false;
+                    if (lyr.IsLocked) { lyr.IsLocked = false; relock = true; }
                     br.UpgradeOpen();
                     br.Erase();
+                    if (relock) lyr.IsLocked = true;
                 }
             }
         }
@@ -1236,18 +1254,36 @@ namespace HybridSurvey
             {
                 if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
                 var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-                if (!br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)) continue;
+
+                // recognize both Hybrd Num and legacy Hybrid Num, incl. dynamic
+                string nm;
+                if (br.IsDynamicBlock)
+                {
+                    var dyn = (BlockTableRecord)tr.GetObject(br.DynamicBlockTableRecord, OpenMode.ForRead);
+                    nm = dyn?.Name ?? br.Name;
+                }
+                else nm = br.Name;
+                nm = (nm ?? string.Empty).Trim();
+                if (!(nm.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase) ||
+                      nm.Equals("Hybrid Num", StringComparison.OrdinalIgnoreCase)))
+                    continue;
 
                 foreach (ObjectId attId in br.AttributeCollection)
                 {
                     var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForRead);
-                    if (ar.Tag.Equals("NUMBER", StringComparison.OrdinalIgnoreCase) &&
-                        int.TryParse(ar.TextString, out int seq) &&
+                    if (ar == null) continue;
+
+                    if ((ar.Tag ?? string.Empty).Equals("NUMBER", StringComparison.OrdinalIgnoreCase) &&
+                        int.TryParse(ar.TextString?.Trim(), out int seq) &&
                         seq > maxNumber)
                     {
+                        var lyr = (LayerTableRecord)tr.GetObject(br.LayerId, OpenMode.ForWrite);
+                        bool relock = false;
+                        if (lyr.IsLocked) { lyr.IsLocked = false; relock = true; }
                         br.UpgradeOpen();
                         br.Erase();
-                        break;                      // one NUMBER per block – next block
+                        if (relock) lyr.IsLocked = true;
+                        break; // one NUMBER per block – next block
                     }
                 }
             }
@@ -1779,8 +1815,6 @@ namespace HybridSurvey
             var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
 
             // Expected map for the *current* working polyline
-            //   id → expected NUMBER string (sequence)
-            //   id → vertex insertion point
             var expectedSeq = new Dictionary<int, string>();
             var idToPt = new Dictionary<int, Point3d>();
             for (int i = 0; i < verts.Count; i++)
@@ -1796,9 +1830,35 @@ namespace HybridSurvey
                 }
             }
 
-            // Scan all Hybrd Num blocks in the given space
-            //   byId: ID → list of (BlockReference, NUMBER text)
-            //   junk: invalid/missing-ID bubbles to delete
+            // Helpers (local)
+            bool IsHybrdNum(BlockReference br)
+            {
+                string nm;
+                if (br.IsDynamicBlock)
+                {
+                    var dyn = (BlockTableRecord)tr.GetObject(br.DynamicBlockTableRecord, OpenMode.ForRead);
+                    nm = dyn?.Name ?? br.Name;
+                }
+                else
+                {
+                    nm = br.Name;
+                }
+                nm = (nm ?? string.Empty).Trim();
+                return nm.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)
+                    || nm.Equals("Hybrid Num", StringComparison.OrdinalIgnoreCase); // legacy support
+            }
+
+            void SafeErase(BlockReference br)
+            {
+                var lyr = (LayerTableRecord)tr.GetObject(br.LayerId, OpenMode.ForWrite);
+                bool relock = false;
+                if (lyr.IsLocked) { lyr.IsLocked = false; relock = true; }
+                br.UpgradeOpen();
+                br.Erase();
+                if (relock) lyr.IsLocked = true;
+            }
+
+            // Scan Hybrd/Hybrid Num blocks in the given space
             var byId = new Dictionary<int, List<Tuple<BlockReference, string>>>();
             var junk = new List<BlockReference>();
 
@@ -1806,9 +1866,9 @@ namespace HybridSurvey
             {
                 if (entId.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
                 var br = (BlockReference)tr.GetObject(entId, OpenMode.ForRead);
-                if (!br.Name.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!IsHybrdNum(br)) continue;
 
-                int idVal = -1; // initialize for definite assignment
+                int idVal = -1; // definite assignment
                 bool okId = false;
                 string numberText = string.Empty;
 
@@ -1849,11 +1909,7 @@ namespace HybridSurvey
             {
                 if (validIds.Contains(kvp.Key)) continue;
                 foreach (var pair in kvp.Value)
-                {
-                    var br = pair.Item1;
-                    br.UpgradeOpen();
-                    br.Erase();
-                }
+                    SafeErase(pair.Item1);
             }
 
             // 2) For each expected ID, keep exactly one bubble; ensure NUMBER matches; delete duplicates
@@ -1875,7 +1931,7 @@ namespace HybridSurvey
                             break;
                         }
                     }
-                    // Else, just take the first
+                    // Else, take the first
                     if (keeper == null)
                         keeper = existingForId[0].Item1;
 
@@ -1884,8 +1940,7 @@ namespace HybridSurvey
                     {
                         var br = pair.Item1;
                         if (br.ObjectId == keeper.ObjectId) continue;
-                        br.UpgradeOpen();
-                        br.Erase();
+                        SafeErase(br);
                     }
 
                     // Ensure keeper has correct ID + NUMBER
@@ -1900,9 +1955,7 @@ namespace HybridSurvey
                         {
                             string wantIdText = id.ToString();
                             if (!string.Equals(ar.TextString?.Trim(), wantIdText, StringComparison.Ordinal))
-                            {
                                 ar.TextString = wantIdText;
-                            }
                         }
                         else if (tag.Equals("NUMBER", StringComparison.OrdinalIgnoreCase))
                         {
@@ -1941,10 +1994,7 @@ namespace HybridSurvey
 
             // 3) Purge all bubbles without a readable ID
             foreach (var br in junk)
-            {
-                br.UpgradeOpen();
-                br.Erase();
-            }
+                SafeErase(br);
         }
 
         /* helper – safely read the hidden ID attribute, returns false if absent / bad */
@@ -2251,7 +2301,7 @@ namespace HybridSurvey
                 trChk.Commit();
             }
 
-            // Local detector — MODEL SPACE only, dynamic-block safe, tolerance-aware
+            // detector — MODEL SPACE only, dynamic-block safe, tolerance-aware
             string DetectTypeNear(Point3d pt, Transaction tr)
             {
                 var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
@@ -2286,7 +2336,6 @@ namespace HybridSurvey
 
             if (payloadMissing)
             {
-                // 3) Warn and ask to build from scratch
                 var answer = MessageBox.Show(
                     "This polyline has vertices but no Hybrid‑Data metadata.\n\n" +
                     "Re‑build the table (and detect XC/RC/EC from existing blocks in Model Space)?",
@@ -2296,7 +2345,6 @@ namespace HybridSurvey
 
                 if (answer == DialogResult.Yes)
                 {
-                    // 4) Build a list of VertexInfo from the polyline’s vertices
                     var verts = new List<VertexInfo>();
                     using (var tr = db.TransactionManager.StartTransaction())
                     {
@@ -2309,42 +2357,32 @@ namespace HybridSurvey
                                 Pt = pt,
                                 N = pt.Y,
                                 E = pt.X,
-                                Type = DetectTypeNear(pt, tr),   // detect from Hybrid_* blocks (MODEL)
+                                Type = DetectTypeNear(pt, tr),
                                 Desc = ""
                             });
                         }
                         tr.Commit();
                     }
 
-                    // 5) Assign unique, non‑zero IDs
                     int nextId = 1;
                     foreach (var v in verts) v.ID = nextId++;
 
-                    // 6) Update the polyline geometry (sync vertex count only)
                     HybridCommands.UpdatePolylineGeometry(_currentPlId, verts);
-
-                    // 7) Insert/update table (XC/RC/EC markers honored by checkbox)
                     HybridCommands.InsertOrUpdate(verts, insertHybrid: _chkHybrid.Checked);
-
-                    // 8) Persist metadata back onto the polyline
                     HybridCommands.WriteVertexData(_currentPlId, db, verts);
 
-                    // 9) Populate the grid
                     _verts = verts;
                     RefreshGrid();
                 }
-                return; // stop here for the missing-payload path
+                return;
             }
 
-            // If metadata exists, continue with existing logic
-            // Skip duplicate point keys
             var oldMap = new Dictionary<Point3d, VertexInfo>(
                 new Point3dEquality(HybridCommands.kMatchTol));
             foreach (var v in jsonList)
                 if (!oldMap.ContainsKey(v.Pt))
                     oldMap.Add(v.Pt, v);
 
-            // Build the list in vertex order (detect type for missing entries)
             var newList = new List<VertexInfo>();
             using (var tr = db.TransactionManager.StartTransaction())
             {
@@ -2363,7 +2401,7 @@ namespace HybridSurvey
                             Pt = pt,
                             N = pt.Y,
                             E = pt.X,
-                            Type = DetectTypeNear(pt, tr),  // MODEL SPACE only
+                            Type = DetectTypeNear(pt, tr),
                             Desc = ""
                         });
                     }
