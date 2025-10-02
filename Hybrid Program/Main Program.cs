@@ -150,6 +150,8 @@ namespace HybridSurvey
 
             AcadApp.DocumentManager.DocumentCreated += OnDocCreated;
             AcadApp.DocumentManager.DocumentActivated += OnDocActivated;
+            // Subscribe to DocumentToBeDestroyed so we can remove hooks and caches
+            AcadApp.DocumentManager.DocumentToBeDestroyed += OnDocToBeDestroyed;
         }
 
         public void Terminate()
@@ -162,9 +164,29 @@ namespace HybridSurvey
 
             AcadApp.DocumentManager.DocumentCreated -= OnDocCreated;
             AcadApp.DocumentManager.DocumentActivated -= OnDocActivated;
+            AcadApp.DocumentManager.DocumentToBeDestroyed -= OnDocToBeDestroyed;
 
             _wired.Clear();
             _orig.Clear();
+        }
+
+        /// <summary>
+        /// Cleans up resources and caches when a document is about to be destroyed.
+        /// This handler unhooks database event handlers and command hooks and clears
+        /// any cached data associated with the drawing.  Without this cleanup,
+        /// stale ObjectIds can linger in static collections and cause instability.
+        /// </summary>
+        private static void OnDocToBeDestroyed(object sender, DocumentCollectionEventArgs e)
+        {
+            var doc = e.Document;
+            if (doc == null) return;
+
+            // Unhook database events and command hooks for this document
+            unhook(doc.Database);
+            UnwireCommandHooks(doc);
+
+            // Clear per‑document caches in HybridCommands
+            HybridCommands.ClearCaches();
         }
 
         /* ============================  wiring  ================================= */
@@ -1466,6 +1488,17 @@ namespace HybridSurvey
             = new Dictionary<ObjectId, Dictionary<Point3d, BlockReference>>();
 
         /// <summary>
+        /// Clears all cached bubble maps.  Call this method when a drawing
+        /// is closing or when the plug‑in is being unloaded to avoid leaving
+        /// stale ObjectIds in the static cache.  Failing to clear this cache
+        /// can result in references to disposed databases and stability issues.
+        /// </summary>
+        internal static void ClearCaches()
+        {
+            _bubbleCache.Clear();
+        }
+
+        /// <summary>
         /// Scans <paramref name="space" /> once and returns a map
         ///   key   = bubble insertion point (tolerance aware)
         ///   value = BlockReference for the bubble
@@ -2097,7 +2130,7 @@ namespace HybridSurvey
                                                         : doc.Database.Filename;
         public VertexForm()
         {
-            ActiveInstance = this;          
+            ActiveInstance = this;
             _homeDwgPath = AnchorFor(AcadApp.DocumentManager.MdiActiveDocument);
             Text = $"Hybrid Vertex Editor  —  {_homeDwgPath}";
             Text += $"  —  {_homeDwgPath}";
@@ -2551,7 +2584,7 @@ namespace HybridSurvey
             if (_grid.GetCellCount(DataGridViewElementStates.Selected) == 0) return;
             var dataObj = _grid.GetClipboardContent();
             if (dataObj != null) Clipboard.SetDataObject(dataObj);
-        } 
+        }
         // VertexForm.cs  – replace the whole method
         // ***  C# 7.3-compatible  ***
         private void Grid_CellValidating(object sender, DataGridViewCellValidatingEventArgs e)
