@@ -8,7 +8,8 @@
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <Platform      Condition=" '$(Platform)'     == '' ">AnyCPU</Platform>
-    <Configurations>Debug;Release;Release2014;Release2015;Release2025</Configurations>
+    <!-- List all configurations and platforms we support -->
+    <Configurations>Debug;Release;Release2015</Configurations>
     <Platforms>AnyCPU;x64</Platforms>
     <ProjectGuid>{099E609C-544E-4EF2-A444-E06DF5668CE3}</ProjectGuid>
     <OutputType>Library</OutputType>
@@ -39,16 +40,6 @@
     <LangVersion>7.3</LangVersion>
   </PropertyGroup>
 
-  <!-- Release 2014 x64 -->
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release2014|x64'">
-    <OutputPath>bin\x64\Release2014\</OutputPath>
-    <Optimize>true</Optimize>
-    <DebugType>pdbonly</DebugType>
-    <DefineConstants>TRACE;ACAD_2014</DefineConstants>
-    <PlatformTarget>x64</PlatformTarget>
-    <LangVersion>7.3</LangVersion>
-  </PropertyGroup>
-
   <!-- Release 2015 x64 -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release2015|x64'">
     <OutputPath>bin\x64\Release2015\</OutputPath>
@@ -59,55 +50,46 @@
     <LangVersion>7.3</LangVersion>
   </PropertyGroup>
 
-  <!-- Release 2025 x64 -->
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release2025|x64'">
-    <OutputPath>bin\x64\Release2025\</OutputPath>
-    <Optimize>true</Optimize>
-    <DebugType>pdbonly</DebugType>
-    <DefineConstants>TRACE;ACAD_2025</DefineConstants>
-    <PlatformTarget>x64</PlatformTarget>
-    <LangVersion>7.3</LangVersion>
-  </PropertyGroup>
+  <!-- Removed Release 2025 configuration -->
 
   <!-- project configurations -->
   <ItemGroup>
-    <ProjectConfiguration Include="Release2014|x64">
-      <Configuration>Release2014</Configuration>
-      <Platform>x64</Platform>
-    </ProjectConfiguration>
     <ProjectConfiguration Include="Release2015|x64">
       <Configuration>Release2015</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
-    <ProjectConfiguration Include="Release2025|x64">
-      <Configuration>Release2025</Configuration>
-      <Platform>x64</Platform>
-    </ProjectConfiguration>
+    <!-- Removed Release2025 project configuration -->
   </ItemGroup>
 
   <!-- references -->
   <ItemGroup>
     <!-- AutoCAD API assemblies – copy to output so ILRepack can see them -->
     <Reference Include="accoremgd">
-      <HintPath Condition="'$(Configuration)'=='Release2014'">C:\Program Files\Autodesk\AutoCAD 2014\accoremgd.dll</HintPath>
       <HintPath Condition="'$(Configuration)'=='Release2015'">C:\Program Files\Autodesk\AutoCAD 2015\accoremgd.dll</HintPath>
-      <HintPath Condition="'$(Configuration)'=='Release2025'">C:\Program Files\Autodesk\AutoCAD 2025\accoremgd.dll</HintPath>
-      <HintPath>..\..\..\..\..\Program Files\Autodesk\AutoCAD 2022\accoremgd.dll</HintPath>
-      <Private>True</Private>
+      <!-- Removed Release2025 hint path -->
+      <!-- Default to the AutoCAD 2015 location -->
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2015\accoremgd.dll</HintPath>
+      <!-- Copy the AutoCAD DLL to output only for Debug builds; for Release builds it is loaded from AutoCAD installation -->
+      <Private Condition="'$(Configuration)'=='Debug'">True</Private>
+      <Private Condition="'$(Configuration)'!='Debug'">False</Private>
     </Reference>
     <Reference Include="acdbmgd">
-      <HintPath Condition="'$(Configuration)'=='Release2014'">C:\Program Files\Autodesk\AutoCAD 2014\acdbmgd.dll</HintPath>
       <HintPath Condition="'$(Configuration)'=='Release2015'">C:\Program Files\Autodesk\AutoCAD 2015\acdbmgd.dll</HintPath>
-      <HintPath Condition="'$(Configuration)'=='Release2025'">C:\Program Files\Autodesk\AutoCAD 2025\acdbmgd.dll</HintPath>
-      <HintPath>..\..\..\..\..\Program Files\Autodesk\AutoCAD 2022\acdbmgd.dll</HintPath>
-      <Private>True</Private>
+      <!-- Removed Release2025 hint path -->
+      <!-- Default to the AutoCAD 2015 location -->
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2015\acdbmgd.dll</HintPath>
+      <!-- Copy the AutoCAD DLL to output only for Debug builds -->
+      <Private Condition="'$(Configuration)'=='Debug'">True</Private>
+      <Private Condition="'$(Configuration)'!='Debug'">False</Private>
     </Reference>
     <Reference Include="acmgd">
-      <HintPath Condition="'$(Configuration)'=='Release2014'">C:\Program Files\Autodesk\AutoCAD 2014\acmgd.dll</HintPath>
       <HintPath Condition="'$(Configuration)'=='Release2015'">C:\Program Files\Autodesk\AutoCAD 2015\acmgd.dll</HintPath>
-      <HintPath Condition="'$(Configuration)'=='Release2025'">C:\Program Files\Autodesk\AutoCAD 2025\acmgd.dll</HintPath>
-      <HintPath>..\..\..\..\..\Program Files\Autodesk\AutoCAD 2022\acmgd.dll</HintPath>
-      <Private>True</Private>
+      <!-- Removed Release2025 hint path -->
+      <!-- Default to the AutoCAD 2015 location -->
+      <HintPath>C:\Program Files\Autodesk\AutoCAD 2015\acmgd.dll</HintPath>
+      <!-- Copy the AutoCAD DLL to output only for Debug builds -->
+      <Private Condition="'$(Configuration)'=='Debug'">True</Private>
+      <Private Condition="'$(Configuration)'!='Debug'">False</Private>
     </Reference>
 
     <!-- Json.NET – will be merged -->
