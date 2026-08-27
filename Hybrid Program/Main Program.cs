@@ -15,6 +15,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Drawing;       // ← ADDED: gives you Size, Point, Color...
+using System.Globalization;
 using System.Linq;
 using System.Runtime.ConstrainedExecution;
 using System.Security.Cryptography;
@@ -56,10 +57,10 @@ namespace HybridSurvey
 
         public int GetHashCode(Point3d p)
         {
-            double m = 1.0 / _eps; // scale to tolerance grid
-            long ix = (long)Math.Round(p.X * m);
-            long iy = (long)Math.Round(p.Y * m);
-            return ((ix * 397) ^ iy).GetHashCode();
+            // Distance-based equality can cross any fixed bucket boundary.  A
+            // constant hash is the only fully correct hash for this comparer;
+            // Hybrid vertex collections are small, so the linear scan is cheap.
+            return 0;
         }
     }
 
@@ -187,6 +188,7 @@ namespace HybridSurvey
 
             // Clear per‑document caches in HybridCommands
             HybridCommands.ClearCaches();
+            _orig.Clear();
         }
 
         /* ============================  wiring  ================================= */
@@ -242,9 +244,52 @@ namespace HybridSurvey
             if (Suspended) return;
 
             if (e.DBObject is AttributeReference ar &&
-                ar.Tag.Equals("NUMBER", StringComparison.OrdinalIgnoreCase))
+                ar.Tag.Equals("NUMBER", StringComparison.OrdinalIgnoreCase) &&
+                IsHybridNumberAttribute(ar))
             {
                 _orig[ar.ObjectId] = ar.TextString;
+            }
+        }
+
+        private static bool IsHybridNumberAttribute(AttributeReference ar)
+        {
+            if (ar == null || ar.Database == null || ar.OwnerId.IsNull || !ar.OwnerId.IsValid)
+                return false;
+
+            try
+            {
+                // ObjectOpenedForModify is raised inside AutoCAD's owning
+                // transaction.  Resolve the owner once here; ObjectModified must
+                // not re-enter the transaction manager while a scale/property
+                // edit is being applied.
+                var tr = ar.Database.TransactionManager.TopTransaction;
+                if (tr == null) return false;
+
+                var br = tr.GetObject(ar.OwnerId, OpenMode.ForRead, false) as BlockReference;
+                if (br == null) return false;
+
+                string blockName = br.Name;
+                if (br.IsDynamicBlock)
+                {
+                    var definition = tr.GetObject(
+                        br.DynamicBlockTableRecord,
+                        OpenMode.ForRead,
+                        false) as BlockTableRecord;
+                    blockName = definition?.Name ?? blockName;
+                }
+
+                return string.Equals(
+                    (blockName ?? string.Empty).Trim(),
+                    "Hybrd Num",
+                    StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(
+                        (blockName ?? string.Empty).Trim(),
+                        "Hybrid Num",
+                        StringComparison.OrdinalIgnoreCase);
+            }
+            catch (System.Exception)
+            {
+                return false;
             }
         }
 
@@ -253,37 +298,33 @@ namespace HybridSurvey
         {
             var db = e.DBObject?.Database;
             if (db == null || IsDbLoading(db)) return;   // drawing still streaming in
-            if (Suspended) return;                       // guard temporarily paused
+            if (Suspended)
+            {
+                if (e.DBObject != null) _orig.Remove(e.DBObject.ObjectId);
+                return;                                  // guard temporarily paused
+            }
 
             var ar = e.DBObject as AttributeReference;
             if (ar == null || !ar.Tag.Equals("NUMBER", StringComparison.OrdinalIgnoreCase))
                 return;
 
-            /* 1) make sure the attribute is inside a Hybrd Num block */
-            var tr = ar.Database.TransactionManager;
-            var br = ar.OwnerId.IsValid
-                   ? tr.GetObject(ar.OwnerId, OpenMode.ForRead) as BlockReference
-                   : null;
-            if (br == null) return;
+            // The owner was verified in onOpened.  Avoid opening any additional
+            // DBObjects from ObjectModified: block X/Y/Z scale edits can modify
+            // attribute geometry and this re-entrant open was the crash path.
+            if (!_orig.TryGetValue(ar.ObjectId, out string oldVal)) return;
+            _orig.Remove(ar.ObjectId);
 
-            string blkName = br.IsDynamicBlock
-                ? ((BlockTableRecord)tr.GetObject(br.DynamicBlockTableRecord, OpenMode.ForRead)).Name
-                : br.Name;
-
-            if (!blkName.Equals("Hybrd Num", StringComparison.OrdinalIgnoreCase))
-                return;
-
-            /* 2) roll back manual edits */
-            if (_orig.TryGetValue(ar.ObjectId, out string oldVal) && oldVal != ar.TextString)
+            bool textChanged = !string.Equals(oldVal, ar.TextString, StringComparison.Ordinal);
+            if (textChanged)
             {
                 if (!ar.IsWriteEnabled) ar.UpgradeOpen();
                 ar.TextString = oldVal;
                 ar.AdjustAlignment(ar.Database);
             }
-            _orig.Remove(ar.ObjectId);
 
-            /* 3) gentle reminder (rate-limited & only when UI is interactive) */
-            if ((DateTime.Now - _lastPopup).TotalSeconds >= POPUP_COOLDOWN_SEC &&
+            /* gentle reminder only for a real text edit, never for scale changes */
+            if (textChanged &&
+                (DateTime.Now - _lastPopup).TotalSeconds >= POPUP_COOLDOWN_SEC &&
                 AcadApp.IsQuiescent)
             {
                 _lastPopup = DateTime.Now;
@@ -317,15 +358,55 @@ namespace HybridSurvey
 
     }
 
-    internal static class HybridCommands
+    internal static partial class HybridCommands
     {
         private const string kTableStyle = "Induction Bend";
         private const string kTableLayer = "Hybrid_Points_TBL";
         private const string kBlockLayer = "L-MON";
         private const double kTxtH = 2.5;
-        private static readonly double[] kColW = { 40, 60, 60, 40, 120 };
+        private const double kTableTxtH = 10.0;
+        private static readonly double[] kColW = { 100, 150, 150, 100, 450 };
         internal const double kMatchTol = 0.03;       // vertex search tolerance
-        private const double kRowH = 4.0;
+        private const double kRowH = 25.0;
+        internal const int kStorageDecimals = HybridValuePolicy.StorageDecimals;
+        internal const int kDisplayDecimals = HybridValuePolicy.DisplayDecimals;
+
+        internal static double StoreCoordinate(double value)
+        {
+            return HybridValuePolicy.StoreCoordinate(value);
+        }
+
+        internal static Point3d StorePoint(Point3d point)
+        {
+            return new Point3d(
+                StoreCoordinate(point.X),
+                StoreCoordinate(point.Y),
+                StoreCoordinate(point.Z));
+        }
+
+        internal static VertexInfo VertexAt(Point3d point, VertexInfo metadata = null)
+        {
+            var stored = StorePoint(point);
+            return new VertexInfo
+            {
+                Pt = stored,
+                N = stored.Y,
+                E = stored.X,
+                Type = metadata?.Type ?? string.Empty,
+                Desc = metadata?.Desc ?? string.Empty,
+                ID = metadata?.ID ?? 0
+            };
+        }
+
+        internal static string DisplayCoordinate(double value)
+        {
+            return HybridValuePolicy.DisplayCoordinate(value);
+        }
+
+        internal static bool TryParseCoordinate(object value, out double coordinate)
+        {
+            return HybridValuePolicy.TryParseCoordinate(value, out coordinate);
+        }
 
         // inside HybridCommands, replace your old SimpleVertex with this:
         private class SimpleVertex
@@ -342,7 +423,10 @@ namespace HybridSurvey
                                            Database db,
                                            List<VertexInfo> verts)
         {
+            if (!TryRequireUtmMode("Write Hybrid Vertex Data")) return;
+
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
+            if (doc == null || db == null || doc.Database != db) return;
 
             using (doc.LockDocument())
             using (var tr = db.TransactionManager.StartTransaction())
@@ -351,8 +435,10 @@ namespace HybridSurvey
                 Polyline pl;
                 try
                 {
-                    // ‘false’ → don’t allow access to an object that is already erased
-                    pl = (Polyline)tr.GetObject(plId, OpenMode.ForWrite, false);
+                    // Open read-only before temporarily unlocking the layer.
+                    // Opening an entity for write while its layer is locked can
+                    // fail before the code gets a chance to repair that state.
+                    pl = (Polyline)tr.GetObject(plId, OpenMode.ForRead, false);
                 }
                 catch (Autodesk.AutoCAD.Runtime.Exception ex) when (IsWasErased(ex))
                 {
@@ -361,49 +447,56 @@ namespace HybridSurvey
                 }
 
                 if (pl == null) return;          // sanity (shouldn’t happen)
-
-                //-- ensure the polyline owns an extension dictionary
-                if (pl.ExtensionDictionary.IsNull)
-                    pl.CreateExtensionDictionary();
-
-                var ext = (DBDictionary)tr.GetObject(pl.ExtensionDictionary, OpenMode.ForWrite);
-
-                //-- ensure “HybridData” dictionary
-                if (!ext.Contains("HybridData"))
+                using (UnlockLayer(tr, pl.LayerId))
                 {
-                    var dict = new DBDictionary();
-                    ext.SetAt("HybridData", dict);
-                    tr.AddNewlyCreatedDBObject(dict, true);
+                    pl.UpgradeOpen();
+                    WriteVertexData(tr, pl, verts);
                 }
-                var dataDict = (DBDictionary)tr.GetObject(ext.GetAt("HybridData"), OpenMode.ForWrite);
-
-                //-- ensure XRecord “Data”
-                Xrecord xr;
-                if (dataDict.Contains("Data"))
-                    xr = (Xrecord)tr.GetObject(dataDict.GetAt("Data"), OpenMode.ForWrite);
-                else
-                {
-                    xr = new Xrecord();
-                    dataDict.SetAt("Data", xr);
-                    tr.AddNewlyCreatedDBObject(xr, true);
-                }
-
-                //-- serialise payload  (round coordinates to 0.001)
-                var jsonPayload = JsonConvert.SerializeObject(
-                    verts.Select(v => new SimpleVertex
-                    {
-                        X = Math.Round(v.Pt.X, 3),
-                        Y = Math.Round(v.Pt.Y, 3),
-                        Type = v.Type,
-                        Desc = v.Desc,
-                        ID = v.ID
-                    }).ToList()
-                );
-
-                xr.Data = new ResultBuffer(new TypedValue((int)DxfCode.Text, jsonPayload));
 
                 tr.Commit();     // commit once, here
             }
+        }
+
+        private static void WriteVertexData(
+            Transaction tr,
+            Polyline pl,
+            IList<VertexInfo> verts)
+        {
+            if (tr == null || pl == null) return;
+
+            if (!pl.IsWriteEnabled) pl.UpgradeOpen();
+            if (pl.ExtensionDictionary.IsNull) pl.CreateExtensionDictionary();
+
+            var ext = (DBDictionary)tr.GetObject(pl.ExtensionDictionary, OpenMode.ForWrite);
+            if (!ext.Contains("HybridData"))
+            {
+                var dict = new DBDictionary();
+                ext.SetAt("HybridData", dict);
+                tr.AddNewlyCreatedDBObject(dict, true);
+            }
+
+            var dataDict = (DBDictionary)tr.GetObject(ext.GetAt("HybridData"), OpenMode.ForWrite);
+            Xrecord xr;
+            if (dataDict.Contains("Data"))
+                xr = (Xrecord)tr.GetObject(dataDict.GetAt("Data"), OpenMode.ForWrite);
+            else
+            {
+                xr = new Xrecord();
+                dataDict.SetAt("Data", xr);
+                tr.AddNewlyCreatedDBObject(xr, true);
+            }
+
+            var jsonPayload = JsonConvert.SerializeObject(
+                (verts ?? new List<VertexInfo>()).Select(v => new SimpleVertex
+                {
+                    X = StoreCoordinate(v.E),
+                    Y = StoreCoordinate(v.N),
+                    Type = v.Type ?? string.Empty,
+                    Desc = v.Desc ?? string.Empty,
+                    ID = v.ID
+                }).ToList());
+
+            xr.Data = new ResultBuffer(new TypedValue((int)DxfCode.Text, jsonPayload));
         }
         // put this helper somewhere in HybridCommands, HybridGuard, or a utilities file
         private static bool IsWasErased(Autodesk.AutoCAD.Runtime.Exception ex)
@@ -443,8 +536,8 @@ namespace HybridSurvey
             // (d) same JSON you write on the polyline
             var simple = verts.Select(v => new
             {
-                X = Math.Round(v.Pt.X, 3),
-                Y = Math.Round(v.Pt.Y, 3),
+                X = StoreCoordinate(v.E),
+                Y = StoreCoordinate(v.N),
                 v.Type,
                 v.Desc,
                 v.ID
@@ -464,7 +557,8 @@ namespace HybridSurvey
             foreach (ObjectId attId in br.AttributeCollection)
             {
                 var ar = (AttributeReference)tr.GetObject(attId, OpenMode.ForWrite);
-                if (ar.Tag == "ID" && ar.TextString != id.ToString())
+                if (ar.Tag.Equals("ID", StringComparison.OrdinalIgnoreCase) &&
+                    ar.TextString != id.ToString())
                 {
                     ar.TextString = id.ToString();
                     return;
@@ -475,45 +569,61 @@ namespace HybridSurvey
         public static List<VertexInfo> ReadVertexData(ObjectId plId, Database db)
         {
             var result = new List<VertexInfo>();
-            using (var tr = db.TransactionManager.StartTransaction())
+            if (db == null || plId.IsNull || !plId.IsValid || plId.IsErased) return result;
+
+            try
             {
-                var pl = (Polyline)tr.GetObject(plId, OpenMode.ForRead);
-                if (pl.ExtensionDictionary.IsNull) { tr.Commit(); return result; }
-                var ext = (DBDictionary)tr.GetObject(pl.ExtensionDictionary, OpenMode.ForRead);
-                if (!ext.Contains("HybridData")) { tr.Commit(); return result; }
-                var dataDict = (DBDictionary)tr.GetObject(ext.GetAt("HybridData"), OpenMode.ForRead);
-                if (!dataDict.Contains("Data")) { tr.Commit(); return result; }
-                var xr = (Xrecord)tr.GetObject(dataDict.GetAt("Data"), OpenMode.ForRead);
-
-                foreach (TypedValue tv in xr.Data)
+                using (var tr = db.TransactionManager.StartOpenCloseTransaction())
                 {
-                    if (tv.TypeCode == (int)DxfCode.Text)
-                    {
-                        var list = JsonConvert
-                           .DeserializeObject<List<SimpleVertex>>((string)tv.Value);
-                        if (list != null)
-                        {
-                            result.AddRange(list.Select(sv => new VertexInfo
-                            {
-                                Pt = new Point3d(sv.X, sv.Y, 0),
-                                N = sv.Y,
-                                E = sv.X,
-                                Type = sv.Type,
-                                Desc = sv.Desc,
-                                ID = sv.ID    // ← new
-                            }));
-                        }
-                    }
+                    var pl = tr.GetObject(plId, OpenMode.ForRead, false) as Polyline;
+                    if (pl != null) result = ReadVertexData(tr, pl);
+                    tr.Commit();
                 }
-
-                tr.Commit();
             }
+            catch (System.Exception) { }
+
             return result;
+        }
+
+        private static List<VertexInfo> ReadVertexData(Transaction tr, Polyline pl)
+        {
+            var result = new List<VertexInfo>();
+            if (tr == null || pl == null || pl.ExtensionDictionary.IsNull) return result;
+
+            var ext = tr.GetObject(pl.ExtensionDictionary, OpenMode.ForRead, false) as DBDictionary;
+            if (ext == null || !ext.Contains("HybridData")) return result;
+
+            var dataDict = tr.GetObject(ext.GetAt("HybridData"), OpenMode.ForRead, false) as DBDictionary;
+            if (dataDict == null || !dataDict.Contains("Data")) return result;
+
+            var xr = tr.GetObject(dataDict.GetAt("Data"), OpenMode.ForRead, false) as Xrecord;
+            if (xr?.Data == null) return result;
+
+            foreach (TypedValue tv in xr.Data)
+            {
+                if (tv.TypeCode != (int)DxfCode.Text || !(tv.Value is string json)) continue;
+
+                var list = JsonConvert.DeserializeObject<List<SimpleVertex>>(json);
+                if (list == null) continue;
+
+                result.AddRange(list.Select(sv => VertexAt(
+                    new Point3d(sv.X, sv.Y, 0),
+                    new VertexInfo
+                    {
+                        Type = sv.Type,
+                        Desc = sv.Desc,
+                        ID = sv.ID
+                    })));
+            }
+
+            return NormalizeVertices(result);
         }
 
         [CommandMethod("HYBRIDPLAN")]
         public static void HybridPlan()
         {
+            if (!TryRequireUtmMode("Open Hybrid Vertex Editor")) return;
+
             // If an editor form already exists, just show/activate it
             if (VertexForm.ActiveInstance != null && !VertexForm.ActiveInstance.IsDisposed)
             {
@@ -531,10 +641,13 @@ namespace HybridSurvey
 
         public static void InsertOrUpdate(IList<VertexInfo> verts, bool insertHybrid)
         {
+            if (!TryRequireUtmMode("Save Hybrid Table Data")) return;
+
             // ‑‑‑ do NOT fire the guard while we touch attributes
             using (HybridGuard.Suspend())
             {
-                if (verts == null || verts.Count == 0) return;
+                var normalizedVertices = NormalizeVertices(verts);
+                if (normalizedVertices.Count == 0) return;
 
                 var doc = AcadApp.DocumentManager.MdiActiveDocument;
                 var db = doc.Database;
@@ -594,28 +707,32 @@ namespace HybridSurvey
 
                     // Fill table
                     tbl.Position = insPt;
-                    tbl.SetSize(verts.Count + 1, 5);
+                    tbl.SetSize(normalizedVertices.Count + 1, 5);
                     tbl.DeleteRows(0, 1);
 
-                    for (int c = 0; c < 5; c++) tbl.Columns[c].Width = kColW[c];
-                    for (int r = 0; r < verts.Count; r++) tbl.Rows[r].Height = kRowH;
+                    ApplyHybridTableLayout(tbl);
 
-                    for (int i = 0; i < verts.Count; i++)
+                    for (int i = 0; i < normalizedVertices.Count; i++)
                     {
-                        var v = verts[i];
+                        var v = normalizedVertices[i];
                         Write(tbl, i, 0, (i + 1).ToString());
-                        Write(tbl, i, 1, v.N.ToString("F2"));
-                        Write(tbl, i, 2, v.E.ToString("F2"));
+                        Write(tbl, i, 1, DisplayCoordinate(v.N));
+                        Write(tbl, i, 2, DisplayCoordinate(v.E));
                         Write(tbl, i, 3, v.Type);
                         Write(tbl, i, 4, v.Desc);
                     }
 
-                    WriteTableMetadata(tbl, verts, tr);
+                    WriteTableMetadata(tbl, normalizedVertices, tr);
+                    tbl.GenerateLayout();
 
                     if (insertHybrid)
                     {
                         EnsureAllHybridBlocks(tr, db);
-                        PlaceHybridBlocks(tr, db, verts);   // already model space
+                        PlaceHybridBlocks(
+                            tr,
+                            db,
+                            normalizedVertices,
+                            "TABLE-" + tbl.Handle);   // legacy table-only API
                     }
 
                     tr.Commit();
@@ -625,8 +742,22 @@ namespace HybridSurvey
         private static void Write(Table tbl, int row, int col, string txt)
         {
             var cell = tbl.Cells[row, col];
-            cell.TextHeight = kTxtH;
+            cell.TextHeight = kTableTxtH;
             cell.TextString = txt ?? "";
+        }
+
+        private static void ApplyHybridTableLayout(Table table)
+        {
+            int columnCount = Math.Min(kColW.Length, table.Columns.Count);
+            for (int column = 0; column < columnCount; column++)
+                table.Columns[column].Width = kColW[column];
+
+            for (int row = 0; row < table.Rows.Count; row++)
+            {
+                table.Rows[row].Height = kRowH;
+                for (int column = 0; column < columnCount; column++)
+                    table.Cells[row, column].TextHeight = kTableTxtH;
+            }
         }
         /// <summary>
         /// Re-sorts all existing "Hybrd Num" blocks along the picked polyline
@@ -655,17 +786,6 @@ namespace HybridSurvey
                 lt.Add(ltr);
                 tr.AddNewlyCreatedDBObject(ltr, true);
             }
-            else
-            {
-                var ltr = (LayerTableRecord)tr.GetObject(lt[name], OpenMode.ForWrite);
-
-                // ⬇️ Only touch these flags if it is *not* the current layer
-                if (db.Clayer != ltr.ObjectId)
-                {
-                    ltr.IsFrozen = false;
-                    ltr.IsLocked = false;
-                }
-            }
         }
 
         /// <summary>
@@ -680,7 +800,10 @@ namespace HybridSurvey
             ObjectId styleId,
             string layerName)
         {
-            var ms = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
+            var blockTable = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(
+                blockTable[BlockTableRecord.ModelSpace],
+                OpenMode.ForRead);
 
             foreach (ObjectId entId in ms)
             {
@@ -700,7 +823,6 @@ namespace HybridSurvey
         private static void EnsureAllHybridBlocks(Transaction tr, Database db)
         {
             EnsureHybridBlock(tr, db, "Hybrid_XC", AcColor.FromColorIndex(ColorMethod.ByAci, 1));
-            EnsureHybridBlock(tr, db, "Hybrid_RC", AcColor.FromColorIndex(ColorMethod.ByAci, 2));
             EnsureHybridBlock(tr, db, "Hybrid_EC", AcColor.FromColorIndex(ColorMethod.ByAci, 3));
         }
 
@@ -733,79 +855,16 @@ namespace HybridSurvey
         private static void PlaceHybridBlocks(
             Transaction tr,
             Database db,
-            IList<VertexInfo> verts)
+            IList<VertexInfo> verts,
+            string ownerKey)
         {
-            var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
-            var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite); // MODEL SPACE
-
-            /* ---------- 1) What we *want* to see on the polyline ------------------ */
-            var want = new Dictionary<Point3d, string>(new Point3dEquality(kMatchTol));
-
-            foreach (var v in verts)
-            {
-                string t = (v.Type ?? string.Empty).Trim().ToUpperInvariant();
-                if (t == "XC" || t == "RC" || t == "EC")
-                    want[v.Pt] = t;                   // last win inside tolerance bucket
-            }
-
-            /* ---------- 2)  Scan existing Hybrid_* blocks ------------------------- */
-            var toErase = new List<BlockReference>();
-
-            foreach (ObjectId id in ms)
-            {
-                if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
-                var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-
-                if (!br.Name.StartsWith("Hybrid_", StringComparison.OrdinalIgnoreCase)) continue;
-
-                /* 2a) Ignore **detail-area** symbols that are NOT located on a vertex */
-                if (!want.TryGetValue(br.Position, out string rightType))
-                    continue;
-
-                /* 2b) Vertex match – keep only if the subtype matches ----------------*/
-                string existingType = br.Name.Substring(7).ToUpperInvariant(); // XC/RC/EC/OC…
-                if (rightType != existingType)
-                    toErase.Add(br);               // wrong subtype → replace later
-            }
-
-            foreach (var br in toErase)
-            {
-                br.UpgradeOpen();
-                br.Erase();
-            }
-
-            /* ---------- 3)  Insert bubbles that are still missing ----------------- */
-            foreach (var v in verts)
-            {
-                string t = (v.Type ?? string.Empty).Trim().ToUpperInvariant();
-                if (!(t == "XC" || t == "RC" || t == "EC")) continue;
-
-                bool present = false;
-                foreach (ObjectId id in ms)
-                {
-                    if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
-                    var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-
-                    if (br.Position.DistanceTo(v.Pt) <= kMatchTol &&
-                        br.Name.Equals("Hybrid_" + t, StringComparison.OrdinalIgnoreCase))
-                    {
-                        present = true;
-                        break;
-                    }
-                }
-                if (present) continue;
-
-                var nb = new BlockReference(v.Pt, bt["Hybrid_" + t])
-                {
-                    Layer = kBlockLayer,
-                    ScaleFactors = new Scale3d(5, 5, 1)
-                };
-                ms.AppendEntity(nb);
-                tr.AddNewlyCreatedDBObject(nb, true);
-
-                // hidden ID stays in sync so markers survive moves (no-op if block has no ID attribute)
-                UpdateHiddenIdIfNeeded(tr, nb, v.ID);
-            }
+            SyncHybridMarkerBlocks(
+                tr,
+                db,
+                ownerKey,
+                new List<VertexInfo>(),
+                verts,
+                insertOrUpdate: true);
         }
         // -----------------------------------------------------------------------------
         //  DeleteStrayNumberBubbles
@@ -863,7 +922,10 @@ namespace HybridSurvey
         internal static string GuessType(Point3d pt, Transaction tr)
         {
             var db = AcadApp.DocumentManager.MdiActiveDocument.Database;
-            var ms = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
+            var blockTable = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+            var ms = (BlockTableRecord)tr.GetObject(
+                blockTable[BlockTableRecord.ModelSpace],
+                OpenMode.ForRead);
 
             foreach (ObjectId id in ms)
             {
@@ -979,6 +1041,31 @@ namespace HybridSurvey
                     idDef.Invisible = true;    // keep it hidden from view
                 }
             }
+
+            // OWNER scopes otherwise-repeating vertex IDs to one polyline.  This
+            // prevents numbering or deletion on one Hybrid polyline from touching
+            // number bubbles that belong to another.
+            if (!ids.TryGetValue("OWNER", out var ownerDef))
+            {
+                ownerDef = new AttributeDefinition
+                {
+                    Tag = "OWNER",
+                    Prompt = "Owner",
+                    Height = kTxtH,
+                    Position = Point3d.Origin,
+                    Invisible = true,
+                    Constant = false
+                };
+                ownerDef.SetDatabaseDefaults();
+                btr.AppendEntity(ownerDef);
+                tr.AddNewlyCreatedDBObject(ownerDef, true);
+            }
+            else if (ownerDef.Constant || !ownerDef.Invisible)
+            {
+                ownerDef.UpgradeOpen();
+                ownerDef.Constant = false;
+                ownerDef.Invisible = true;
+            }
         }
         /// <summary>
         /// Overwrites the vertex coordinates of <paramref name="plId"/> with the
@@ -989,6 +1076,8 @@ namespace HybridSurvey
         /// </summary>
         public static void UpdatePolylineGeometry(ObjectId plId, IList<VertexInfo> verts)
         {
+            if (!TryRequireUtmMode("Update Hybrid Polyline Geometry")) return;
+
             if (plId == ObjectId.Null || !plId.IsValid || verts == null) return;
 
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
@@ -997,38 +1086,16 @@ namespace HybridSurvey
             using (doc.LockDocument())
             using (var tr = db.TransactionManager.StartTransaction())
             {
-                // ---- open the polyline for write (fail fast if it was erased) -------
-                if (!(tr.GetObject(plId, OpenMode.ForWrite, false) is Polyline pl))
+                // Open read-only first so a locked layer cannot reject the object
+                // before we have a chance to unlock it.
+                if (!(tr.GetObject(plId, OpenMode.ForRead, false) is Polyline pl))
                     return;
 
-                // ---- make sure we are allowed to edit the layer ----------------------
-                var lyr = (LayerTableRecord)tr.GetObject(pl.LayerId, OpenMode.ForWrite);
-                bool relock = false;
-                if (lyr.IsLocked)
+                using (UnlockLayer(tr, pl.LayerId))
                 {
-                    lyr.IsLocked = false;
-                    relock = true;
+                    pl.UpgradeOpen();
+                    ApplyPolylineGeometry(pl, NormalizeVertices(verts));
                 }
-
-                // ---- update, add or remove vertices ---------------------------------
-                int existing = pl.NumberOfVertices;
-                int target = verts.Count;
-                int common = Math.Min(existing, target);
-
-                // edit the ones that already exist
-                for (int i = 0; i < common; i++)
-                    pl.SetPointAt(i, new Point2d(verts[i].E, verts[i].N));
-
-                // add any new ones
-                for (int i = existing; i < target; i++)
-                    pl.AddVertexAt(i, new Point2d(verts[i].E, verts[i].N), 0, 0, 0);
-
-                // remove any surplus ones (work backwards!)
-                for (int i = existing - 1; i >= target; i--)
-                    pl.RemoveVertexAt(i);
-
-                // put the layer back the way we found it
-                if (relock) lyr.IsLocked = true;
 
                 tr.Commit();
             }
@@ -1134,61 +1201,7 @@ namespace HybridSurvey
         [CommandMethod("AddNumbering")]
         public static void AddNumbering()
         {
-            // prevent HybridGuard pop-ups while we manipulate attributes
-            using (HybridGuard.Suspend())
-            {
-                var doc = AcadApp.DocumentManager.MdiActiveDocument;
-                var db = doc.Database;
-                var ed = doc.Editor;
-
-                using (doc.LockDocument())
-                using (var tr = db.TransactionManager.StartTransaction())
-                {
-                    // make sure L-MON exists, is (temporarily) unlocked, etc.
-                    EnsureNumberingContext(tr, db,
-                        out var bt, out var space, out var defRec);
-
-                    _bubbleCache.Remove(space.ObjectId);               // clear per-drawing cache
-                    UpgradeExistingHybrdNumBubbles(tr, db, space, bt); // ← NEW: add IDs to legacy bubbles
-
-                    /* ----- let the user pick the target polyline ----- */
-                    var peo = new PromptEntityOptions(
-                        "\nSelect polyline to place numbers on: ");
-                    peo.SetRejectMessage("\nThat’s not a polyline.");
-                    peo.AddAllowedClass(typeof(Polyline), false);
-
-                    var per = ed.GetEntity(peo);
-                    if (per.Status != PromptStatus.OK) return;
-
-                    var plId = per.ObjectId;
-                    var pl = (Polyline)tr.GetObject(plId, OpenMode.ForRead);
-
-                    /* ----- build vertex list (re-using any existing IDs) ----- */
-                    var verts = BuildVertexListWithIds(tr, db, pl);
-
-                    /* ----- (re)create bubbles and NUMBER attributes ----- */
-                    UpdateOrCreateBubbles(tr, db, space, defRec, verts);
-
-                    /* ----- persist metadata on the polyline ----- */
-                    WriteVertexData(plId, db, verts);
-
-                    /* ----- update (or create) the table if it exists ----- */
-                    ObjectId tblId = FindExistingTableId(
-                        tr, db, EnsureTableStyle(tr, db), kTableLayer);
-
-                    if (tblId != ObjectId.Null)
-                    {
-                        var tbl = (Table)tr.GetObject(tblId, OpenMode.ForWrite);
-                        WriteTableMetadata(tbl, verts, tr);
-                    }
-
-                    tr.Commit();
-                    ed.WriteMessage(
-                        $"\nAddNumbering: {verts.Count} vertices processed.");
-                }
-
-                doc.Editor.Regen();
-            }
+            SyncNumberingCommand();
         }
 
         // -----------------------------------------------------------------------------
@@ -1197,69 +1210,7 @@ namespace HybridSurvey
         [CommandMethod("UpdateNumbering")]
         public static void UpdateNumbering()
         {
-            using (HybridGuard.Suspend())   // prevent guard pop‑ups
-            {
-                var doc = AcadApp.DocumentManager.MdiActiveDocument;
-                var db = doc.Database;
-                var ed = doc.Editor;
-
-                // Pick the polyline
-                var peo = new PromptEntityOptions("\nSelect polyline to renumber: ");
-                peo.SetRejectMessage("\nThat’s not a polyline.");
-                peo.AddAllowedClass(typeof(Polyline), false);
-                var per = ed.GetEntity(peo);
-                if (per.Status != PromptStatus.OK) return;
-                var plId = per.ObjectId;
-
-                // Build current vertex list from the polyline, preserving IDs from stored HybridData
-                var oldData = ReadVertexData(plId, db);
-                var oldMap = oldData
-                    .GroupBy(v => v.Pt, new Point3dEquality(kMatchTol))
-                    .Select(g => g.First())
-                    .ToDictionary(v => v.Pt, v => v, new Point3dEquality(kMatchTol));
-
-                var verts = new List<VertexInfo>();
-                using (var tr = db.TransactionManager.StartTransaction())
-                {
-                    var pl = (Polyline)tr.GetObject(plId, OpenMode.ForRead);
-                    for (int i = 0; i < pl.NumberOfVertices; i++)
-                    {
-                        var pt = pl.GetPoint3dAt(i);
-                        verts.Add(oldMap.TryGetValue(pt, out var vi)
-                            ? vi
-                            : new VertexInfo { Pt = pt, N = pt.Y, E = pt.X, Type = "", Desc = "", ID = 0 });
-                    }
-                    tr.Commit();
-                }
-
-                // Ensure every vertex has a non-zero unique ID
-                int maxId = verts.Any() ? verts.Max(v => v.ID) : 0;
-                int nextId = Math.Max(1, maxId + 1);
-                foreach (var v in verts)
-                    if (v.ID == 0)
-                        v.ID = nextId++;
-
-                // Strict reconcile by (ID, NUMBER): keep exactly one per ID and correct NUMBER; delete the rest
-                using (doc.LockDocument())
-                using (var tr = db.TransactionManager.StartTransaction())
-                {
-                    EnsureNumberingContext(tr, db, out _, out var space, out var defRec);
-
-                    // Upgrade legacy bubbles that might be missing the ID attribute
-                    UpgradeExistingHybrdNumBubbles(tr, db, space,
-                        (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead));
-
-                    UpdateOrCreateBubbles(tr, db, space, defRec, verts);
-
-                    // Persist latest metadata back onto the polyline
-                    WriteVertexData(plId, db, verts);
-
-                    tr.Commit();
-                }
-
-                ed.WriteMessage($"\nUpdateNumbering: {verts.Count} vertices processed.");
-                doc.Editor.Regen();
-            }
+            SyncNumberingCommand();
         }
         // -----------------------------------------------------------------------------
         //  DeleteBubblesAboveNumber
@@ -1319,6 +1270,8 @@ namespace HybridSurvey
         [CommandMethod("DUMPVERTEXDATA")]
         public static void DumpVertexData()
         {
+            if (!TryRequireUtmMode("Dump Hybrid Vertex Data")) return;
+
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
@@ -1394,60 +1347,78 @@ namespace HybridSurvey
         [CommandMethod("PurgeHybridData")]
         public static void PurgeHybridData()
         {
+            if (!TryRequireUtmMode("Purge Hybrid Data")) return;
+
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
 
-            using (doc.LockDocument())
-            using (var tr = db.TransactionManager.StartTransaction())
+            try
             {
-                var btrMs = (BlockTableRecord)tr.GetObject(db.CurrentSpaceId, OpenMode.ForRead);
-
-                int purged = 0;
-
-                foreach (ObjectId entId in btrMs)
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
                 {
-                    // --- only consider polylines -------------------------------------------------
-                    if (!(tr.GetObject(entId, OpenMode.ForRead) is Polyline pl)) continue;
+                    var blockTable = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var btrMs = (BlockTableRecord)tr.GetObject(
+                        blockTable[BlockTableRecord.ModelSpace],
+                        OpenMode.ForRead);
 
-                    // layer info ­- we might have to unlock it temporarily
-                    var lyrRec = (LayerTableRecord)tr.GetObject(pl.LayerId, OpenMode.ForWrite);
-                    bool relock = false;
+                    int purged = 0;
 
-                    if (lyrRec.IsLocked)
+                    foreach (ObjectId entId in btrMs)
                     {
-                        lyrRec.IsLocked = false;   // ← safe: the layer may be current
-                        relock = true;
-                    }
+                        // --- only consider polylines ---------------------------------------------
+                        if (!(tr.GetObject(entId, OpenMode.ForRead) is Polyline pl)) continue;
 
-                    // switch the polyline to write-mode *after* we’re sure the layer is unlocked
-                    pl.UpgradeOpen();
+                        // layer info ­- we might have to unlock it temporarily
+                        var lyrRec = (LayerTableRecord)tr.GetObject(pl.LayerId, OpenMode.ForWrite);
+                        bool relock = false;
 
-                    if (!pl.ExtensionDictionary.IsNull)
-                    {
-                        var ext = (DBDictionary)tr.GetObject(pl.ExtensionDictionary, OpenMode.ForWrite);
-                        if (ext.Contains("HybridData"))
+                        if (lyrRec.IsLocked)
                         {
-                            // erase the Xrecord + remove the entry from the dict
-                            var xrecId = ext.GetAt("HybridData");
-                            ext.Remove("HybridData");
-
-                            if (tr.GetObject(xrecId, OpenMode.ForWrite) is Xrecord xr)
-                                xr.Erase();
-
-                            purged++;
+                            lyrRec.IsLocked = false;   // safe: the layer may be current
+                            relock = true;
                         }
+
+                        // switch the polyline to write-mode after its layer is unlocked
+                        pl.UpgradeOpen();
+
+                        if (!pl.ExtensionDictionary.IsNull)
+                        {
+                            var ext = (DBDictionary)tr.GetObject(pl.ExtensionDictionary, OpenMode.ForWrite);
+                            if (ext.Contains("HybridData"))
+                            {
+                                // Remove and erase the owned HybridData dictionary. It
+                                // owns both Data and Owner Xrecords, so erasing only an
+                                // assumed Xrecord here would leak/corrupt metadata.
+                                var dataId = ext.GetAt("HybridData");
+                                var dataDictionary = tr.GetObject(
+                                    dataId,
+                                    OpenMode.ForWrite,
+                                    false) as DBDictionary;
+                                ext.Remove("HybridData");
+                                dataDictionary?.Erase();
+
+                                purged++;
+                            }
+                        }
+
+                        // put the layer back the way we found it
+                        if (relock) lyrRec.IsLocked = true;
                     }
 
-                    // put the layer back the way we found it
-                    if (relock) lyrRec.IsLocked = true;
+                    tr.Commit();
+                    ed.WriteMessage($"\nPurged HybridData from {purged} polyline{(purged == 1 ? "" : "s")}.");
                 }
 
-                tr.Commit();
-                ed.WriteMessage($"\nPurged HybridData from {purged} polyline{(purged == 1 ? "" : "s")}.");
+                doc.Editor.Regen();
             }
-
-            doc.Editor.Regen();
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage(
+                    "\nHybrid data was not purged. No partial drawing changes were committed. " +
+                    ex.Message);
+            }
         }
 
 
@@ -1456,7 +1427,8 @@ namespace HybridSurvey
                                                    BlockTable bt,
                                                    BlockTableRecord defRec,
                                                    Point3d pt,
-                                                   int id)
+                                                   int id,
+                                                   string ownerKey = "")
         {
             var br = new BlockReference(pt, bt["Hybrd Num"])
             {
@@ -1471,10 +1443,14 @@ namespace HybridSurvey
                 if (tr.GetObject(defId, OpenMode.ForRead) is AttributeDefinition def)
                 {
                     var ar = new AttributeReference();
-                    ar.SetAttributeFromBlock(def, Matrix3d.Identity);
-                    ar.Position = pt;
+                    ar.SetAttributeFromBlock(def, br.BlockTransform);
                     ar.Invisible = def.Invisible;
-                    ar.TextString = def.Tag == "ID" ? id.ToString() : string.Empty;
+                    if (def.Tag.Equals("ID", StringComparison.OrdinalIgnoreCase))
+                        ar.TextString = id.ToString();
+                    else if (def.Tag.Equals("OWNER", StringComparison.OrdinalIgnoreCase))
+                        ar.TextString = ownerKey ?? string.Empty;
+                    else
+                        ar.TextString = string.Empty;
 
                     br.AttributeCollection.AppendAttribute(ar);
                     tr.AddNewlyCreatedDBObject(ar, true);
@@ -1651,6 +1627,8 @@ namespace HybridSurvey
         [CommandMethod("TransferVertexData")]
         public static void TransferVertexData()
         {
+            if (!TryRequireUtmMode("Transfer Hybrid Data")) return;
+
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
@@ -1670,59 +1648,81 @@ namespace HybridSurvey
             var perDst = ed.GetEntity(peoDst);
             if (perDst.Status != PromptStatus.OK) return;
             ObjectId dstId = perDst.ObjectId;
-
-            // 3) Read all metadata from source
-            var srcList = ReadVertexData(srcId, db);
-
-            // 4) Build a new list for the target: preserve matches within tolerance
-            var newList = new List<VertexInfo>();
-            var tol = kMatchTol;                               // drawing precision
-
-            using (var tr = db.TransactionManager.StartTransaction())
+            if (srcId == dstId)
             {
-                var plDst = (Polyline)tr.GetObject(dstId, OpenMode.ForRead);
-                for (int i = 0; i < plDst.NumberOfVertices; i++)
-                {
-                    var pt = plDst.GetPoint3dAt(i);
-
-                    int idx = srcList.FindIndex(v => v.Pt.DistanceTo(pt) <= tol);
-                    if (idx >= 0)
-                    {
-                        var vi = srcList[idx];
-                        newList.Add(new VertexInfo
-                        {
-                            Pt = vi.Pt,
-                            N = vi.N,
-                            E = vi.E,
-                            Type = vi.Type,
-                            Desc = vi.Desc,
-                            ID = vi.ID
-                        });
-                        srcList.RemoveAt(idx);                 // mark as used
-                    }
-                    else
-                    {
-                        newList.Add(new VertexInfo
-                        {
-                            Pt = pt,
-                            N = pt.Y,
-                            E = pt.X,
-                            Type = "",
-                            Desc = "",
-                            ID = 0
-                        });
-                    }
-                }
-                tr.Commit();
+                ed.WriteMessage("\nSource and target must be different polylines.");
+                return;
             }
 
-            // append any leftover source vertices so metadata isn’t lost
-            foreach (var extra in srcList)
-                newList.Add(extra);
+            try
+            {
+                using (doc.LockDocument())
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var source = tr.GetObject(srcId, OpenMode.ForRead, false) as Polyline;
+                    var target = tr.GetObject(dstId, OpenMode.ForRead, false) as Polyline;
+                    if (source == null || target == null ||
+                        !IsModelSpaceEntity(tr, db, source) ||
+                        !IsModelSpaceEntity(tr, db, target))
+                    {
+                        ed.WriteMessage("\nBoth source and target must be Model Space 2D polylines.");
+                        return;
+                    }
 
-            // 5) Write that metadata back onto the target polyline
-            WriteVertexData(dstId, db, newList);
-            ed.WriteMessage($"\nTransferred metadata to {newList.Count} vertices.");
+                    var sourceVertices = ReadVertexData(tr, source);
+                    if (sourceVertices.Count == 0)
+                    {
+                        ed.WriteMessage("\nThe source polyline has no stored Hybrid data.");
+                        return;
+                    }
+
+                    var previousTargetVertices = ReadVertexData(tr, target);
+
+                    var unusedSource = new List<VertexInfo>(sourceVertices);
+                    var transferred = new List<VertexInfo>();
+                    for (int i = 0; i < target.NumberOfVertices; i++)
+                    {
+                        Point3d point = StorePoint(target.GetPoint3dAt(i));
+                        int matchIndex = unusedSource.FindIndex(
+                            vertex => vertex.Pt.DistanceTo(point) <= kMatchTol);
+                        if (matchIndex >= 0)
+                        {
+                            // Metadata follows the match, but coordinates always
+                            // remain the target polyline's actual rounded point.
+                            transferred.Add(VertexAt(point, unusedSource[matchIndex]));
+                            unusedSource.RemoveAt(matchIndex);
+                        }
+                        else
+                        {
+                            transferred.Add(VertexAt(point));
+                        }
+                    }
+
+                    transferred = NormalizeVertices(transferred);
+                    using (UnlockLayer(tr, target.LayerId))
+                        WriteVertexData(tr, target, transferred);
+
+                    UpdateOwnedTable(
+                        tr,
+                        db,
+                        ed,
+                        transferred,
+                        target.Handle.ToString(),
+                        createIfMissing: false,
+                        legacyMatchVertices: previousTargetVertices);
+
+                    // Do not create marker/number blocks as a side effect of a
+                    // transfer. The explicit Save and Numbering actions own those.
+                    tr.Commit();
+                    ed.WriteMessage(
+                        $"\nTransferred Hybrid data to {transferred.Count} target vertices; " +
+                        $"{unusedSource.Count} unmatched source rows were not appended.");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage("\nHybrid data was not transferred. " + ex.Message);
+            }
         }
 
 
@@ -1777,6 +1777,7 @@ namespace HybridSurvey
         private static List<VertexInfo> ParseRowsFromTable(Table tbl)
         {
             var verts = new List<VertexInfo>();
+            if (tbl == null || tbl.Columns.Count < 5) return verts;
             int rowCount = tbl.Rows.Count;
 
             for (int r = 0; r < rowCount; r++)
@@ -1784,16 +1785,14 @@ namespace HybridSurvey
                 string sN = tbl.Cells[r, 1].TextString;
                 string sE = tbl.Cells[r, 2].TextString;
 
-                if (double.TryParse(sN, out double N) &&
-                    double.TryParse(sE, out double E))
+                if (TryParseCoordinate(sN, out double N) &&
+                    TryParseCoordinate(sE, out double E))
                 {
-                    double n = Math.Round(N, 3);
-                    double e = Math.Round(E, 3);
                     verts.Add(new VertexInfo
                     {
-                        Pt = new Point3d(e, n, 0),
-                        N = n,
-                        E = e,
+                        Pt = new Point3d(E, N, 0),
+                        N = N,
+                        E = E,
                         Type = tbl.Cells[r, 3].TextString,
                         Desc = tbl.Cells[r, 4].TextString,
                         ID = 0          // no ID info in visible rows
@@ -2050,6 +2049,8 @@ namespace HybridSurvey
         [CommandMethod("REBUILDPLINEFROMTABLE")]
         public static void RebuildPolylineFromTable()
         {
+            if (!TryRequireUtmMode("Rebuild Polyline From Table")) return;
+
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
             var db = doc.Database;
             var ed = doc.Editor;
@@ -2063,16 +2064,41 @@ namespace HybridSurvey
                 var per = ed.GetEntity(peo);
                 if (per.Status != PromptStatus.OK) return;
 
+                using (var validation = db.TransactionManager.StartOpenCloseTransaction())
+                {
+                    var selectedTable = validation.GetObject(
+                        per.ObjectId,
+                        OpenMode.ForRead,
+                        false) as Table;
+                    if (selectedTable == null ||
+                        !IsModelSpaceEntity(validation, db, selectedTable))
+                    {
+                        ed.WriteMessage("\nSelect a Hybrid table from Model Space.");
+                        return;
+                    }
+                    validation.Commit();
+                }
+
                 List<VertexInfo> verts;
 
-                // 1) Preferred path – pull JSON from the table itself
-                if (TryReadTableMetadata(per.ObjectId, db, out verts))
+                // Preferred path: pull 0.001 metadata from the table itself.
+                bool readMetadata = false;
+                try
+                {
+                    readMetadata = TryReadTableMetadata(per.ObjectId, db, out verts);
+                }
+                catch (System.Exception ex)
+                {
+                    ed.WriteMessage("\nStored table metadata is unreadable; using visible rows. " + ex.Message);
+                    verts = new List<VertexInfo>();
+                }
+
+                if (readMetadata)
                 {
                     ed.WriteMessage("\nUsing vertex metadata stored on the table.");
                 }
                 else
                 {
-                    // 2) Fallback – parse visible text rows
                     using (var tr = db.TransactionManager.StartTransaction())
                     {
                         var tbl = (Table)tr.GetObject(per.ObjectId, OpenMode.ForRead);
@@ -2087,29 +2113,71 @@ namespace HybridSurvey
                     return;
                 }
 
-                // build new polyline -------------------------------------------------
-                using (var tr = db.TransactionManager.StartTransaction())
+                try
                 {
-                    var tbl = (Table)tr.GetObject(per.ObjectId, OpenMode.ForRead);
-                    var btrOwner = (BlockTableRecord)tr.GetObject(tbl.OwnerId, OpenMode.ForWrite);
+                    verts = NormalizeVertices(verts);
+                }
+                catch (System.Exception ex)
+                {
+                    ed.WriteMessage("\nThe table contains an invalid coordinate. " + ex.Message);
+                    return;
+                }
 
-                    var pl = new Polyline();
-                    for (int i = 0; i < verts.Count; i++)
+                try
+                {
+                    // Build and persist the new polyline atomically in Model Space.
+                    using (var tr = db.TransactionManager.StartTransaction())
                     {
-                        pl.AddVertexAt(i,
-                            new Point2d(verts[i].Pt.X, verts[i].Pt.Y),
-                            0, 0, 0);
+                        var tbl = (Table)tr.GetObject(per.ObjectId, OpenMode.ForRead, false);
+                        var blockTable = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                        var model = (BlockTableRecord)tr.GetObject(
+                            blockTable[BlockTableRecord.ModelSpace],
+                            OpenMode.ForWrite);
+
+                        Polyline pl;
+                        using (UnlockLayer(tr, db.Clayer))
+                        {
+                            pl = new Polyline();
+                            pl.SetDatabaseDefaults(db);
+                            pl.LayerId = db.Clayer;
+                            for (int i = 0; i < verts.Count; i++)
+                            {
+                                pl.AddVertexAt(
+                                    i,
+                                    new Point2d(verts[i].E, verts[i].N),
+                                    0,
+                                    0,
+                                    0);
+                            }
+                            model.AppendEntity(pl);
+                            tr.AddNewlyCreatedDBObject(pl, true);
+                            WriteVertexData(tr, pl, verts);
+                        }
+
+                        using (UnlockLayer(tr, tbl.LayerId))
+                        {
+                            tbl.UpgradeOpen();
+                            ApplyHybridTableLayout(tbl);
+                            WriteTableMetadata(tbl, verts, tr);
+                            WriteOwnerMetadata(tr, tbl, pl.Handle.ToString());
+                            tbl.GenerateLayout();
+                        }
+
+                        tr.Commit();
+                        ed.WriteMessage($"\nRebuilt Model Space polyline with {verts.Count} vertices.");
                     }
-                    btrOwner.AppendEntity(pl);
-                    tr.AddNewlyCreatedDBObject(pl, true);
-
-                    // persist metadata back onto the *new* polyline
-                    WriteVertexData(pl.ObjectId, db, verts);
-
-                    tr.Commit();
-                    ed.WriteMessage($"\nRebuilt polyline with {verts.Count} vertices.");
+                }
+                catch (System.Exception ex)
+                {
+                    ed.WriteMessage("\nPolyline was not rebuilt. " + ex.Message);
                 }
             }
+        }
+
+        [CommandMethod("REBUILDPOLYLINEFROMTABLE")]
+        public static void RebuildPolylineFromTableAlias()
+        {
+            RebuildPolylineFromTable();
         }
 
     }
@@ -2123,6 +2191,10 @@ namespace HybridSurvey
         private ObjectId _currentPlId = ObjectId.Null;
         private string _homeDwgPath;        // now writable!
         private bool _locked;               // UI disabled when drawing changes
+        private DataGridViewCell _editingCoordinateCell;
+        private double _editingCoordinateOriginal;
+        private string _editingCoordinateDisplay;
+        private bool _hasEditingCoordinateOriginal;
         internal static VertexForm ActiveInstance { get; private set; }
         // ==========  stable-anchor helper  ==========
         private static string AnchorFor(Document doc) =>
@@ -2133,8 +2205,8 @@ namespace HybridSurvey
             ActiveInstance = this;
             _homeDwgPath = AnchorFor(AcadApp.DocumentManager.MdiActiveDocument);
             Text = $"Hybrid Vertex Editor  —  {_homeDwgPath}";
-            Text += $"  —  {_homeDwgPath}";
-            ClientSize = new System.Drawing.Size(1000, 580);
+            ClientSize = new System.Drawing.Size(1240, 640);
+            MinimumSize = new System.Drawing.Size(900, 500);
             FormBorderStyle = FormBorderStyle.Sizable;
             MaximizeBox = true;
             MinimizeBox = true;
@@ -2142,10 +2214,11 @@ namespace HybridSurvey
             var pnl = new FlowLayoutPanel
             {
                 Dock = DockStyle.Bottom,
-                Height = 45,
+                Height = 88,
                 Padding = new Padding(5),
-                WrapContents = false,
-                AutoScroll = false
+                WrapContents = true,
+                AutoScroll = true,
+                FlowDirection = System.Windows.Forms.FlowDirection.LeftToRight
             };
 
             _grid = new DataGridView
@@ -2153,54 +2226,92 @@ namespace HybridSurvey
                 Dock = DockStyle.Fill,
                 AllowUserToAddRows = false,
                 AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
-                ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText
+                ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
+                SelectionMode = DataGridViewSelectionMode.CellSelect,
+                MultiSelect = true
             };
 
             _grid.Columns.Add("#", "#");
             _grid.Columns["#"].ReadOnly = true;
-            _grid.Columns.Add("Northing", "Northing");
-            _grid.Columns.Add("Easting", "Easting");
+            _grid.Columns["#"].FillWeight = 35;
+
+            var coordinateStyle = new DataGridViewCellStyle
+            {
+                Format = "F2",
+                FormatProvider = CultureInfo.InvariantCulture,
+                NullValue = string.Empty
+            };
+            _grid.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                Name = "Northing",
+                HeaderText = "Northing",
+                ValueType = typeof(double),
+                DefaultCellStyle = coordinateStyle,
+                FillWeight = 85
+            });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                Name = "Easting",
+                HeaderText = "Easting",
+                ValueType = typeof(double),
+                DefaultCellStyle = coordinateStyle.Clone() as DataGridViewCellStyle,
+                FillWeight = 85
+            });
 
             var typeCol = new DataGridViewComboBoxColumn
             {
                 Name = "Type",
                 HeaderText = "Type",
                 FlatStyle = FlatStyle.Flat,
-                DropDownWidth = 60
+                DropDownWidth = 80,
+                FillWeight = 55
             };
             typeCol.Items.AddRange("", "XC", "RC", "EC", "OC", "Other");
             _grid.Columns.Add(typeCol);
             _grid.Columns.Add("Desc", "Description");
 
+            // Row order is the polyline's vertex order. Header sorting would
+            // visually reorder values without reordering the backing IDs.
+            foreach (DataGridViewColumn column in _grid.Columns)
+                column.SortMode = DataGridViewColumnSortMode.NotSortable;
+
             Controls.Add(_grid);
             Controls.Add(pnl);
 
             /* ---------- command buttons ---------- */
-            var btnGet = new Button { Text = "Get Polyline", Width = 120 };
-            var btnUpd = new Button { Text = "Update Polyline", Width = 120 };
-            var btnAddNum = new Button { Text = "Add Numbering", Width = 120 };
-            var btnUpdNum = new Button { Text = "Update Numbering", Width = 120 };
-            var btnRebuild = new Button { Text = "Rebuild Polyline", Width = 140 };
-            var btnTransfer = new Button { Text = "Transfer Data", Width = 120 };
-            var btnOK = new Button { Text = "Insert/Update", Width = 100 };
-            _chkHybrid = new CheckBox { Text = "Hybrid Blocks", Checked = true };
-            var btnRemove = new Button { Text = "Remove Point", Width = 120 };
+            Button ActionButton(string text) => new Button
+            {
+                Text = text,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Height = 30,
+                Margin = new Padding(3)
+            };
+
+            var btnGet = ActionButton("Select Polyline With Hybrid Data");
+            var btnNumbering = ActionButton("Add / Update Numbering");
+            var btnRebuild = ActionButton("Rebuild Polyline From Table");
+            var btnTransfer = ActionButton("Transfer Hybrid Data From a Polyline to Another");
+            var btnOK = ActionButton("Save and Update Data to Table & Polyline");
+            _chkHybrid = new CheckBox
+            {
+                Text = "Update XC / EC Blocks",
+                Checked = true,
+                AutoSize = true,
+                Margin = new Padding(8, 8, 8, 3)
+            };
+            var btnRemove = ActionButton("Delete Selected Point(s)");
 
             /*   ➜  add all the “regular” buttons first   */
             pnl.Controls.AddRange(new Control[] {
-        btnGet, btnUpd, btnAddNum, btnUpdNum,
-        btnRebuild, btnTransfer, _chkHybrid, btnOK
+        btnGet, btnNumbering, btnRebuild, btnTransfer,
+        _chkHybrid, btnOK, btnRemove
     });
-
-            /*   ➜  finally append  “Remove Point” so it floats to the right   */
-            pnl.Controls.Add(btnRemove);
 
             /* ---------- event wiring ---------- */
             btnRemove.Click += RemoveSelected_Click;
             btnGet.Click += (s, e) => PickAndPopulate();
-            btnUpd.Click += (s, e) => PickAndPopulate();
-            btnAddNum.Click += (s, e) => HybridCommands.AddNumbering();
-            btnUpdNum.Click += (s, e) => HybridCommands.UpdateNumbering();
+            btnNumbering.Click += AddOrUpdateNumbering_Click;
             btnRebuild.Click += (s, e) => HybridCommands.RebuildPolylineFromTable();
             btnTransfer.Click += (s, e) => HybridCommands.TransferVertexData();
             btnOK.Click += InsertUpdate_Click;
@@ -2219,6 +2330,9 @@ namespace HybridSurvey
             };
 
             _grid.CellValidating += Grid_CellValidating;
+            _grid.CellBeginEdit += Grid_CellBeginEdit;
+            _grid.CellEndEdit += Grid_CellEndEdit;
+            _grid.CellParsing += Grid_CellParsing;
             _grid.DataError += (s, e) =>
             {
                 if (e.ColumnIndex == _grid.Columns["Type"].Index)
@@ -2250,7 +2364,11 @@ namespace HybridSurvey
             if (string.Equals(doomed, _homeDwgPath, StringComparison.OrdinalIgnoreCase))
             {
                 // marshal back to UI thread – the event fires on AutoCAD’s thread
-                BeginInvoke((MethodInvoker)(() => Close()));
+                if (!IsDisposed && IsHandleCreated)
+                    BeginInvoke((MethodInvoker)(() =>
+                    {
+                        if (!IsDisposed) Close();
+                    }));
             }
         }
 
@@ -2311,190 +2429,144 @@ namespace HybridSurvey
         // VertexForm.cs – revised PickAndPopulate
         private void PickAndPopulate()
         {
+            if (!HybridCommands.TryRequireUtmMode("Select Polyline With Hybrid Data")) return;
+
             var doc = AcadApp.DocumentManager.MdiActiveDocument;
-            var db = doc.Database;
             var ed = doc.Editor;
 
-            // 1) Let the user pick a polyline
-            var opts = new PromptEntityOptions("\nSelect polyline");
-            opts.SetRejectMessage("\nMust be a polyline");
+            var opts = new PromptEntityOptions("\nSelect Model Space polyline with Hybrid data: ");
+            opts.SetRejectMessage("\nSelect a 2D polyline.");
             opts.AddAllowedClass(typeof(Polyline), false);
             var res = ed.GetEntity(opts);
             if (res.Status != PromptStatus.OK) return;
 
-            _currentPlId = res.ObjectId;
-
-            // 2) Read any stored HybridData
-            var jsonList = HybridCommands.ReadVertexData(_currentPlId, db);
-            bool payloadMissing;
-            using (var trChk = db.TransactionManager.StartTransaction())
+            if (!HybridCommands.LoadPolylineVertices(
+                    res.ObjectId,
+                    out var loaded,
+                    out var hadStoredData,
+                    out var error))
             {
-                var plChk = (Polyline)trChk.GetObject(_currentPlId, OpenMode.ForRead);
-                payloadMissing = jsonList.Count == 0 && plChk.NumberOfVertices > 0;
-                trChk.Commit();
-            }
-
-            // detector — MODEL SPACE only, dynamic-block safe, tolerance-aware
-            string DetectTypeNear(Point3d pt, Transaction tr)
-            {
-                var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
-                var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
-
-                foreach (ObjectId id in ms)
-                {
-                    if (id.ObjectClass != RXObject.GetClass(typeof(BlockReference))) continue;
-                    var br = (BlockReference)tr.GetObject(id, OpenMode.ForRead);
-
-                    if (br.Position.DistanceTo(pt) > HybridCommands.kMatchTol) continue;
-
-                    string name;
-                    if (br.IsDynamicBlock)
-                    {
-                        var dyn = (BlockTableRecord)tr.GetObject(br.DynamicBlockTableRecord, OpenMode.ForRead);
-                        name = dyn?.Name ?? br.Name;
-                    }
-                    else
-                    {
-                        name = br.Name;
-                    }
-
-                    name = (name ?? string.Empty).ToUpperInvariant();
-                    if (name.Contains("HYBRID_XC")) return "XC";
-                    if (name.Contains("HYBRID_RC")) return "RC";
-                    if (name.Contains("HYBRID_EC")) return "EC";
-                    if (name.StartsWith("FDI") || name.StartsWith("FDSPIKE")) return "OC";
-                }
-                return "";
-            }
-
-            if (payloadMissing)
-            {
-                var answer = MessageBox.Show(
-                    "This polyline has vertices but no Hybrid‑Data metadata.\n\n" +
-                    "Re‑build the table (and detect XC/RC/EC from existing blocks in Model Space)?",
-                    "Hybrid Survey",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Question);
-
-                if (answer == DialogResult.Yes)
-                {
-                    var verts = new List<VertexInfo>();
-                    using (var tr = db.TransactionManager.StartTransaction())
-                    {
-                        var pl = (Polyline)tr.GetObject(_currentPlId, OpenMode.ForRead);
-                        for (int i = 0; i < pl.NumberOfVertices; i++)
-                        {
-                            var pt = pl.GetPoint3dAt(i);
-                            verts.Add(new VertexInfo
-                            {
-                                Pt = pt,
-                                N = pt.Y,
-                                E = pt.X,
-                                Type = DetectTypeNear(pt, tr),
-                                Desc = ""
-                            });
-                        }
-                        tr.Commit();
-                    }
-
-                    int nextId = 1;
-                    foreach (var v in verts) v.ID = nextId++;
-
-                    HybridCommands.UpdatePolylineGeometry(_currentPlId, verts);
-                    HybridCommands.InsertOrUpdate(verts, insertHybrid: _chkHybrid.Checked);
-                    HybridCommands.WriteVertexData(_currentPlId, db, verts);
-
-                    _verts = verts;
-                    RefreshGrid();
-                }
+                MessageBox.Show(
+                    error,
+                    "Hybrid Vertex Editor",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
                 return;
             }
 
-            var oldMap = new Dictionary<Point3d, VertexInfo>(
-                new Point3dEquality(HybridCommands.kMatchTol));
-            foreach (var v in jsonList)
-                if (!oldMap.ContainsKey(v.Pt))
-                    oldMap.Add(v.Pt, v);
+            // Selection/reload is deliberately read-only.  It reconciles current
+            // polyline vertices with stored metadata in memory; the explicit Save
+            // action is the only UI path that writes geometry/table/block data.
+            _currentPlId = res.ObjectId;
+            _verts = loaded;
+            RefreshGrid();
 
-            var newList = new List<VertexInfo>();
-            using (var tr = db.TransactionManager.StartTransaction())
+            if (!hadStoredData && loaded.Count > 0)
+                ed.WriteMessage(
+                    "\nNo stored Hybrid metadata was found. Current vertices were loaded; use Save when the rows are ready.");
+        }
+
+        private void AddOrUpdateNumbering_Click(object sender, EventArgs e)
+        {
+            if (_currentPlId.IsNull || !_currentPlId.IsValid || _currentPlId.IsErased)
             {
-                var pl = (Polyline)tr.GetObject(res.ObjectId, OpenMode.ForRead);
-                for (int i = 0; i < pl.NumberOfVertices; i++)
+                MessageBox.Show(
+                    "Select a polyline with Hybrid data first.",
+                    "Hybrid Vertex Editor",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+            if (!HybridCommands.TryRequireUtmMode("Add / Update Numbering")) return;
+
+            if (HybridCommands.AddOrUpdateNumbering(
+                    _currentPlId,
+                    out var updatedVertices,
+                    out var error))
+            {
+                _verts = updatedVertices;
+                RefreshGrid();
+            }
+            else
+            {
+                MessageBox.Show(
+                    error,
+                    "Hybrid Vertex Editor",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+            }
+        }
+
+        private bool TryReadGridVertices(out List<VertexInfo> vertices, out string error)
+        {
+            vertices = new List<VertexInfo>();
+            error = string.Empty;
+            _grid.EndEdit();
+
+            for (int i = 0; i < _grid.Rows.Count; i++)
+            {
+                var row = _grid.Rows[i];
+                if (!HybridCommands.TryParseCoordinate(row.Cells["Northing"].Value, out var north) ||
+                    !HybridCommands.TryParseCoordinate(row.Cells["Easting"].Value, out var east))
                 {
-                    var pt = pl.GetPoint3dAt(i);
-                    if (oldMap.TryGetValue(pt, out var vi))
-                    {
-                        newList.Add(vi);
-                    }
-                    else
-                    {
-                        newList.Add(new VertexInfo
-                        {
-                            Pt = pt,
-                            N = pt.Y,
-                            E = pt.X,
-                            Type = DetectTypeNear(pt, tr),
-                            Desc = ""
-                        });
-                    }
+                    error = "Row " + (i + 1) + " needs valid Northing and Easting values using a dot (.) decimal separator.";
+                    return false;
                 }
-                tr.Commit();
+
+                var existing = i < _verts.Count ? _verts[i] : null;
+                vertices.Add(new VertexInfo
+                {
+                    Pt = new Point3d(east, north, existing?.Pt.Z ?? 0.0),
+                    N = north,
+                    E = east,
+                    Type = Convert.ToString(row.Cells["Type"].Value) ?? string.Empty,
+                    Desc = Convert.ToString(row.Cells["Desc"].Value) ?? string.Empty,
+                    ID = existing?.ID ?? 0
+                });
             }
 
-            _verts = newList;
-            RefreshGrid();
+            return true;
         }
 
         // VertexForm.cs  – FULL replacement of InsertUpdate_Click
         private void InsertUpdate_Click(object sender, EventArgs e)
         {
-            // 1) Make sure the cached polyline still exists
             if (_currentPlId == ObjectId.Null || !_currentPlId.IsValid || _currentPlId.IsErased)
             {
-                MessageBox.Show("Pick a polyline with “Get Polyline” first.",
+                MessageBox.Show("Select a polyline with Hybrid data first.",
                                 "Hybrid Vertex Editor", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+            if (!HybridCommands.TryRequireUtmMode("Save and Update Hybrid Data")) return;
 
-            // 2) Keep _verts length in sync with grid
-            while (_verts.Count < _grid.Rows.Count) _verts.Add(new VertexInfo { ID = 0 });
-            while (_verts.Count > _grid.Rows.Count) _verts.RemoveAt(_verts.Count - 1);
-
-            // 3) Copy grid → _verts (store to 3 dp)
-            for (int i = 0; i < _grid.Rows.Count; i++)
+            if (!TryReadGridVertices(out var pendingVertices, out var validationError))
             {
-                var r = _grid.Rows[i];
-                double north = Math.Round(double.Parse(r.Cells["Northing"].Value?.ToString() ?? "0"), 3);
-                double east = Math.Round(double.Parse(r.Cells["Easting"].Value?.ToString() ?? "0"), 3);
-
-                _verts[i] = new VertexInfo
-                {
-                    Pt = new Point3d(east, north, 0),
-                    N = north,
-                    E = east,
-                    Type = r.Cells["Type"].Value?.ToString() ?? "",
-                    Desc = r.Cells["Desc"].Value?.ToString() ?? "",
-                    ID = _verts[i].ID          // preserve whatever ID we already had
-                };
+                MessageBox.Show(
+                    validationError,
+                    "Invalid Hybrid data",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
             }
 
-            // 3b) Guarantee every vertex has a unique non-zero ID (safe for empty list)
-            int nextId = _verts.Count == 0 ? 1 : _verts.Max(v => v.ID) + 1;
-            foreach (var v in _verts) if (v.ID == 0) v.ID = nextId++;
+            if (HybridCommands.SaveAndUpdate(
+                    _currentPlId,
+                    pendingVertices,
+                    _chkHybrid.Checked,
+                    out var savedVertices,
+                    out var saveError))
+            {
+                _verts = savedVertices;
+                RefreshGrid();
+                return;
+            }
 
-            // 4) Push geometry + metadata + table (no Hybrd Num bubble work here)
-            HybridCommands.UpdatePolylineGeometry(_currentPlId, _verts);
-            HybridCommands.InsertOrUpdate(_verts, _chkHybrid.Checked);
-            HybridCommands.WriteVertexData(
-                _currentPlId,
-                AcadApp.DocumentManager.MdiActiveDocument.Database,
-                _verts);
-
-            // NOTE: Per your request, we do NOT create or modify Hybrd Num bubbles here.
-            //       Bubbles are only created/updated when you run AddNumbering/UpdateNumbering.
-
-            RefreshGrid();
+            if (!string.IsNullOrWhiteSpace(saveError))
+                MessageBox.Show(
+                    saveError,
+                    "Hybrid data was not saved",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
         }
 
         /// <summary>
@@ -2508,57 +2580,70 @@ namespace HybridSurvey
         // VertexForm.cs – FULL replacement of RemoveSelected_Click
         private void RemoveSelected_Click(object sender, EventArgs e)
         {
-            if (_grid.SelectedRows.Count == 0) return;
-            if (_currentPlId == ObjectId.Null || !_currentPlId.IsValid || _currentPlId.IsErased) return;
-
-            using (HybridGuard.Suspend())           // silence guard
+            if (_currentPlId == ObjectId.Null || !_currentPlId.IsValid || _currentPlId.IsErased)
             {
-                /* 1) delete rows + remember orphaned IDs --------------------------- */
-                var goneIds = new HashSet<int>();
-                foreach (DataGridViewRow r in _grid.SelectedRows)
-                {
-                    int idx = r.Index;
-                    if (idx < _verts.Count) goneIds.Add(_verts[idx].ID);
-                }
-                foreach (DataGridViewRow r in _grid.SelectedRows.Cast<DataGridViewRow>()
-                                                                .OrderByDescending(r => r.Index))
-                {
-                    _verts.RemoveAt(r.Index);
-                    _grid.Rows.Remove(r);
-                }
-
-                /* 2) update polyline + metadata ----------------------------------- */
-                HybridCommands.UpdatePolylineGeometry(_currentPlId, _verts);
-                HybridCommands.WriteVertexData(
-                    _currentPlId,
-                    AcadApp.DocumentManager.MdiActiveDocument.Database,
-                    _verts);
-
-                /* 3) bubble maintenance (ID purge + NUMBER>count purge) ------------ */
-                var doc = AcadApp.DocumentManager.MdiActiveDocument;
-                var db = doc.Database;
-
-                using (doc.LockDocument())
-                using (var tr = db.TransactionManager.StartTransaction())
-                {
-                    HybridCommands.EnsureNumberingContext(
-                        tr, db, out _, out var space, out var defRec);
-
-                    // 3 a) delete bubbles whose hidden ID is now gone
-                    HybridCommands.DeleteStrayNumberBubbles(tr, space,
-                                            new HashSet<int>(_verts.Select(v => v.ID)));
-
-                    // 3 b) delete bubbles whose NUMBER > row-count
-                    HybridCommands.DeleteBubblesAboveNumber(tr, space, _verts.Count, db);
-
-                    // 3 c) re-sync NUMBER text / create missing bubbles
-                    HybridCommands.UpdateOrCreateBubbles(tr, db, space, defRec, _verts);
-
-                    tr.Commit();
-                }
-
-                RefreshGrid();
+                MessageBox.Show(
+                    "Select a polyline with Hybrid data first.",
+                    "Hybrid Vertex Editor",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
             }
+            if (!HybridCommands.TryRequireUtmMode("Delete Hybrid Point")) return;
+
+            var selectedIndexes = _grid.SelectedCells
+                .Cast<DataGridViewCell>()
+                .Select(cell => cell.RowIndex)
+                .Concat(_grid.SelectedRows.Cast<DataGridViewRow>().Select(row => row.Index))
+                .Where(index => index >= 0 && index < _grid.Rows.Count)
+                .Distinct()
+                .OrderBy(index => index)
+                .ToList();
+            if (selectedIndexes.Count == 0 && _grid.CurrentCell != null)
+                selectedIndexes.Add(_grid.CurrentCell.RowIndex);
+            if (selectedIndexes.Count == 0) return;
+
+            string noun = selectedIndexes.Count == 1 ? "point" : "points";
+            if (MessageBox.Show(
+                    "Delete the selected " + noun + " from the table, polyline, and any managed blocks?",
+                    "Delete Hybrid " + noun,
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning) != DialogResult.Yes)
+                return;
+
+            if (!TryReadGridVertices(out var pendingVertices, out var validationError))
+            {
+                MessageBox.Show(
+                    validationError,
+                    "Invalid Hybrid data",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            var removeSet = new HashSet<int>(selectedIndexes);
+            var remaining = pendingVertices
+                .Where((vertex, index) => !removeSet.Contains(index))
+                .ToList();
+
+            if (HybridCommands.DeletePointsAndUpdate(
+                    _currentPlId,
+                    remaining,
+                    _chkHybrid.Checked,
+                    out var savedVertices,
+                    out var error))
+            {
+                _verts = savedVertices;
+                if (_verts.Count == 0) _currentPlId = ObjectId.Null;
+                RefreshGrid();
+                return;
+            }
+
+            MessageBox.Show(
+                error,
+                "Hybrid point was not deleted",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
         }
 
 
@@ -2571,19 +2656,103 @@ namespace HybridSurvey
             {
                 CopySelectionToClipboard();
                 e.Handled = true;
+                e.SuppressKeyPress = true;
             }
             else if (e.Control && e.KeyCode == Keys.V)
             {
                 PasteClipboardToGrid();
                 e.Handled = true;
+                e.SuppressKeyPress = true;
             }
         }
 
         private void CopySelectionToClipboard()
         {
-            if (_grid.GetCellCount(DataGridViewElementStates.Selected) == 0) return;
-            var dataObj = _grid.GetClipboardContent();
-            if (dataObj != null) Clipboard.SetDataObject(dataObj);
+            var selected = _grid.SelectedCells
+                .Cast<DataGridViewCell>()
+                .Where(cell => cell.RowIndex >= 0 && cell.ColumnIndex >= 0)
+                .ToList();
+            if (selected.Count == 0) return;
+
+            int minRow = selected.Min(cell => cell.RowIndex);
+            int maxRow = selected.Max(cell => cell.RowIndex);
+            int minColumn = selected.Min(cell => cell.ColumnIndex);
+            int maxColumn = selected.Max(cell => cell.ColumnIndex);
+            var selectedKeys = new HashSet<int>(
+                selected.Select(cell =>
+                    (cell.RowIndex * _grid.ColumnCount) + cell.ColumnIndex));
+            var clipboard = new StringBuilder();
+
+            for (int row = minRow; row <= maxRow; row++)
+            {
+                if (row > minRow) clipboard.AppendLine();
+                for (int column = minColumn; column <= maxColumn; column++)
+                {
+                    if (column > minColumn) clipboard.Append('\t');
+                    int key = (row * _grid.ColumnCount) + column;
+                    if (!selectedKeys.Contains(key)) continue;
+
+                    var cell = _grid[column, row];
+                    string value;
+                    if (IsCoordinateColumn(cell.OwningColumn.Name) &&
+                        HybridCommands.TryParseCoordinate(cell.Value, out var coordinate))
+                    {
+                        // Clipboard retains storage precision even though the
+                        // grid deliberately renders these values with F2.
+                        value = HybridValuePolicy.StorageCoordinateText(coordinate);
+                    }
+                    else
+                    {
+                        value = Convert.ToString(
+                            cell.FormattedValue,
+                            CultureInfo.InvariantCulture) ?? string.Empty;
+                        value = value.Replace('\t', ' ')
+                                     .Replace('\r', ' ')
+                                     .Replace('\n', ' ');
+                    }
+
+                    clipboard.Append(value);
+                }
+            }
+
+            Clipboard.SetText(clipboard.ToString());
+        }
+
+        private static bool IsCoordinateColumn(string columnName)
+        {
+            return columnName == "Northing" || columnName == "Easting";
+        }
+
+        private void Grid_CellBeginEdit(
+            object sender,
+            DataGridViewCellCancelEventArgs e)
+        {
+            _editingCoordinateCell = null;
+            _editingCoordinateDisplay = string.Empty;
+            _hasEditingCoordinateOriginal = false;
+
+            if (e.RowIndex < 0 || e.ColumnIndex < 0 ||
+                !IsCoordinateColumn(_grid.Columns[e.ColumnIndex].Name))
+                return;
+
+            var cell = _grid[e.ColumnIndex, e.RowIndex];
+            if (!HybridCommands.TryParseCoordinate(cell.Value, out var original))
+                return;
+
+            _editingCoordinateCell = cell;
+            _editingCoordinateOriginal = original;
+            _editingCoordinateDisplay = Convert.ToString(
+                cell.FormattedValue,
+                CultureInfo.InvariantCulture) ??
+                HybridCommands.DisplayCoordinate(original);
+            _hasEditingCoordinateOriginal = true;
+        }
+
+        private void Grid_CellEndEdit(object sender, DataGridViewCellEventArgs e)
+        {
+            _editingCoordinateCell = null;
+            _editingCoordinateDisplay = string.Empty;
+            _hasEditingCoordinateOriginal = false;
         }
         // VertexForm.cs  – replace the whole method
         // ***  C# 7.3-compatible  ***
@@ -2607,12 +2776,7 @@ namespace HybridSurvey
                 }
 
                 // 2) Must parse with invariant culture so “.” is the only decimal mark
-                double dummy;
-                if (!double.TryParse(
-                        value,
-                        System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture,
-                        out dummy))
+                if (!HybridCommands.TryParseCoordinate(value, out _))
                 {
                     e.Cancel = true;
                     MessageBox.Show(
@@ -2634,6 +2798,40 @@ namespace HybridSurvey
             }
         }
 
+        private void Grid_CellParsing(object sender, DataGridViewCellParsingEventArgs e)
+        {
+            string columnName = _grid.Columns[e.ColumnIndex].Name;
+            if (!IsCoordinateColumn(columnName)) return;
+
+            if (_hasEditingCoordinateOriginal &&
+                ReferenceEquals(
+                    _editingCoordinateCell,
+                    _grid[e.ColumnIndex, e.RowIndex]) &&
+                HybridValuePolicy.TryResolveEditedCoordinate(
+                    e.Value,
+                    _editingCoordinateOriginal,
+                    _editingCoordinateDisplay,
+                    out var resolvedCoordinate))
+            {
+                // Entering and leaving a coordinate cell exposes only its F2
+                // text. Preserve the original hidden third decimal unless the
+                // user actually changes that text; changed text is normalized
+                // through the same 0.001 storage policy.
+                e.Value = resolvedCoordinate;
+                e.ParsingApplied = true;
+                return;
+            }
+
+            if (HybridCommands.TryParseCoordinate(e.Value, out var coordinate))
+            {
+                // Keep the underlying 0.001 value while the column's F2 format
+                // displays 0.00.  A routine save therefore cannot discard the
+                // hidden third decimal.
+                e.Value = coordinate;
+                e.ParsingApplied = true;
+            }
+        }
+
         // VertexForm.cs  – REPLACE the entire PasteClipboardToGrid method
         // (no other changes required)
 
@@ -2641,6 +2839,27 @@ namespace HybridSurvey
         {
             string text = Clipboard.GetText();
             if (string.IsNullOrEmpty(text)) return;
+
+            text = text.TrimEnd('\r', '\n');
+            if (_grid.Rows.Count == 0)
+            {
+                _verts.Add(new VertexInfo());
+                _grid.Rows.Add(1, 0.0, 0.0, string.Empty, string.Empty);
+            }
+
+            string[] sourceLines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            string[][] sourceCells = sourceLines.Select(line => line.Split('\t')).ToArray();
+
+            // Excel-style fill: a copied single cell is broadcast to every
+            // selected editable cell, without copying or replacing whole rows.
+            if (sourceCells.Length == 1 && sourceCells[0].Length == 1 &&
+                _grid.SelectedCells.Count > 1)
+            {
+                string fillValue = sourceCells[0][0];
+                foreach (DataGridViewCell target in _grid.SelectedCells)
+                    TrySetPastedCell(target, fillValue, showError: false);
+                return;
+            }
 
             /* ───── find insertion start (first selected, else [row0,col1]) ───── */
             var startCell = _grid.SelectedCells.Count > 0
@@ -2650,8 +2869,6 @@ namespace HybridSurvey
 
             int startRow = startCell.RowIndex;
             int startCol = startCell.ColumnIndex;
-
-            var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
 
             /* helper to grow the backing list + grid rows */
             void EnsureRow(int r)
@@ -2667,41 +2884,61 @@ namespace HybridSurvey
                         Desc = "",
                         ID = 0
                     });
-                    _grid.Rows.Add(_grid.Rows.Count + 1, "", "", "", "");
+                    _grid.Rows.Add(_grid.Rows.Count + 1, 0.0, 0.0, "", "");
                 }
             }
 
-            /* ───────── paste loop with comma-decimal guard ───────── */
-            for (int i = 0; i < lines.Length; i++)
+            for (int i = 0; i < sourceCells.Length; i++)
             {
-                if (string.IsNullOrEmpty(lines[i])) continue;
-                string[] cells = lines[i].Split('\t');
                 EnsureRow(startRow + i);
 
-                for (int j = 0; j < cells.Length; j++)
+                for (int j = 0; j < sourceCells[i].Length; j++)
                 {
                     int col = startCol + j;
                     if (col >= _grid.ColumnCount) break;      // ignore overflow
                     if (_grid.Columns[col].ReadOnly) continue; // e.g. “#”
+                    TrySetPastedCell(
+                        _grid[col, startRow + i],
+                        sourceCells[i][j],
+                        showError: true);
+                }
+            }
+        }
 
-                    string val = cells[j];
+        private bool TrySetPastedCell(
+            DataGridViewCell cell,
+            string value,
+            bool showError)
+        {
+            if (cell == null || cell.ReadOnly) return false;
+            string columnName = cell.OwningColumn.Name;
 
-                    // Reject comma decimals for numeric columns
-                    string colName = _grid.Columns[col].Name;
-                    bool numericCol = (colName == "Northing" || colName == "Easting");
-                    if (numericCol && val.IndexOf(',') >= 0)
-                    {
+            if (columnName == "Northing" || columnName == "Easting")
+            {
+                if (value.IndexOf(',') >= 0 ||
+                    !HybridCommands.TryParseCoordinate(value, out var coordinate))
+                {
+                    if (showError)
                         MessageBox.Show(
-                            "Use a dot (.) for decimals, not a comma.",
+                            "Coordinate values must be finite numbers using a dot (.) decimal separator.",
                             "Invalid coordinate",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Warning);
-                        continue;   // skip this offending cell
-                    }
-
-                    _grid[col, startRow + i].Value = val;
+                    return false;
                 }
+
+                cell.Value = coordinate;
+                return true;
             }
+
+            if (columnName == "Type")
+            {
+                var typeColumn = (DataGridViewComboBoxColumn)_grid.Columns["Type"];
+                if (!typeColumn.Items.Contains(value)) typeColumn.Items.Add(value);
+            }
+
+            cell.Value = value;
+            return true;
         }
 
         private void RefreshGrid()
@@ -2714,8 +2951,8 @@ namespace HybridSurvey
                     col.Items.Add(v.Type);
                 _grid.Rows.Add(
                     _grid.Rows.Count + 1,
-                    v.N.ToString("F2"),
-                    v.E.ToString("F2"),
+                    HybridCommands.StoreCoordinate(v.N),
+                    HybridCommands.StoreCoordinate(v.E),
                     v.Type,
                     v.Desc
                 );

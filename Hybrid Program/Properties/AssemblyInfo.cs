@@ -6,13 +6,19 @@ using System.Runtime.InteropServices;
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
 [assembly: AssemblyTitle("Hybrid Program")]
-[assembly: AssemblyDescription("")]
+[assembly: AssemblyDescription("AutoCAD Hybrid Manager. Version " + HybridSurvey.PluginVersionInfo.VersionNumber + " | Version date: " + HybridSurvey.PluginVersionInfo.VersionDate)]
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("")]
 [assembly: AssemblyProduct("Hybrid Program")]
 [assembly: AssemblyCopyright("Copyright ©  2025")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
+[assembly: AssemblyMetadata("SemanticVersion", HybridSurvey.PluginVersionInfo.VersionNumber)]
+[assembly: AssemblyMetadata("VersionDate", HybridSurvey.PluginVersionInfo.VersionDate)]
+[assembly: AssemblyMetadata("PluginVersionDate", HybridSurvey.PluginVersionInfo.VersionDate)]
+[assembly: AssemblyMetadata("PluginVersion", HybridSurvey.PluginVersionInfo.VersionNumber)]
+[assembly: AssemblyMetadata("VisibleVersion", HybridSurvey.PluginVersionInfo.DisplayVersionAndDate)]
+[assembly: AssemblyInformationalVersion(HybridSurvey.PluginVersionInfo.VersionNumber + "+plugin-version-date." + HybridSurvey.PluginVersionInfo.VersionDate)]
 
 // Setting ComVisible to false makes the types in this assembly not visible
 // to COM components.  If you need to access a type in this assembly from
@@ -30,4 +36,4 @@ using System.Runtime.InteropServices;
 //      Revision
 //
 [assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.1.1.0")]

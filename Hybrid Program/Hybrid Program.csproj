@@ -110,8 +110,16 @@
   <!-- sources -->
   <ItemGroup>
     <Compile Include="Main Program.cs" />
+    <Compile Include="HybridCommands.Workflows.cs" />
+    <Compile Include="HybridMarkerPolicy.cs" />
+    <Compile Include="HybridNumberingOwnershipPolicy.cs" />
+    <Compile Include="HybridValuePolicy.cs" />
+    <Compile Include="JtbUtmDxfScaleReader.cs" />
+    <Compile Include="JtbUtmModeGuard.cs" />
+    <Compile Include="PluginVersionInfo.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <None    Include="packages.config" />
+    <None    Include="ILRepack.targets" />
   </ItemGroup>
 
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
@@ -123,7 +131,7 @@
   <!-- merge after successful build -->
   <Target Name="ILRepackMerge"
           AfterTargets="Build"
-          Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+          Condition="'$(Platform)'=='x64'">
 
     <ItemGroup>
       <InputAssemblies Include="$(TargetPath)" />
@@ -138,7 +146,7 @@
       DebugInfo       ="true"
       Parallel        ="true"
       TargetKind      ="SameAsPrimaryAssembly"
-      LibraryPath     ="$(TargetDir)" />
+      LibraryPath     ="$(TargetDir);C:\Program Files\Autodesk\AutoCAD 2015" />
   </Target>
 
   <!-- stop early if the ILRepack package is missing -->

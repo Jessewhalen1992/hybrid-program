@@ -1,0 +1,8 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    The NuGet package otherwise injects a second Release-only repack that
+    merges every DLL in the output folder and cannot resolve AutoCAD's API
+    assemblies. Hybrid Program.csproj owns the deliberate Newtonsoft-only
+    HybridProgram_One.dll merge for every x64 configuration.
+  -->
+</Project>
